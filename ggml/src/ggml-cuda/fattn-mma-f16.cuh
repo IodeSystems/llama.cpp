@@ -551,6 +551,30 @@ static bool ggml_cuda_fattn_mma_fused_type_supported(const ggml_type type) {
     return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_F8_E4M3;
 }
 
+// Compiled set of the fused path (build cost). By default only K q8_0 + V q8_0 at DKQ=DV=256 is instantiated, and the
+// DKQ=DV=512 vec kernels are left out; every other combination runs the unfused path. The PR's full set (q8_0/q4_0/f8_e4m3
+// per side at DKQ=DV=128/256/512, and the 512 vec kernels) put ~200 kernels into fattn.cu and the fused instance files:
+// a box1 build (sm_86 + sm_120) passed 2 h. -DGGML_CUDA_FATTN_MMA_FUSED_ALL compiles the full set again; it needs a
+// template-instance split before upstreaming.
+#ifdef GGML_CUDA_FATTN_MMA_FUSED_ALL
+static constexpr bool ggml_cuda_fattn_mma_fused_all = true;
+#else
+static constexpr bool ggml_cuda_fattn_mma_fused_all = false;
+#endif // GGML_CUDA_FATTN_MMA_FUSED_ALL
+
+// Head sizes with compiled fused kernels:
+static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_fused_dkq_compiled(const int DKQ) {
+    return ggml_cuda_fattn_mma_fused_all ? (DKQ == 128 || DKQ == 256 || DKQ == 512) : DKQ == 256;
+}
+
+// K/V type pairs with compiled fused kernels:
+static bool ggml_cuda_fattn_mma_fused_types_compiled(const ggml_type type_K, const ggml_type type_V) {
+    if (ggml_cuda_fattn_mma_fused_all) {
+        return ggml_cuda_fattn_mma_fused_type_supported(type_K) && ggml_cuda_fattn_mma_fused_type_supported(type_V);
+    }
+    return type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0;
+}
+
 // 8 B cp.async variant for the fused DKQ=DV=128 staging: q8_0/q4_0 rows of a 128-value head are 136/72 B, never 16 B
 // aligned, while the cache row pitch (K->nb[1]) equals the row size and both staging rows start out 8 B aligned.
 // cp.async.ca supports 4/8/16 B transfers (the .cg form upstream exposes only takes 16 B). Both pointers need 8 B alignment.
@@ -2435,7 +2459,8 @@ static bool ggml_cuda_fattn_mma_f16_fused_q_supported(
         const ggml_tensor * K, const ggml_tensor * V, const int DKQ, const int DV, const int ncols2, const int nstages) {
     const bool q_K = ggml_cuda_fattn_mma_fused_type_supported(K->type);
     const bool q_V = ggml_cuda_fattn_mma_fused_type_supported(V->type);
-    const bool fused_mode_ok = ncols2 == 8
+    const bool fused_mode_ok = ncols2 == 8 && DV == DKQ && ggml_cuda_fattn_mma_fused_dkq_compiled(DKQ)
+        && ggml_cuda_fattn_mma_fused_types_compiled(K->type, V->type)
         && ((DKQ == 128 && DV == 128 && nstages > 1) || (DKQ == 256 && DV == 256 && nstages > 1) || (DKQ == 512 && DV == 512 && nstages == 1));
     // The DKQ=DV=128 q8_0/q4_0 rows (4 quantization blocks, 136/72 B) can never be 16 B aligned; their cp.async staging
     // runs over 8 B chunks, so the family's rows and pointers only need to be 8 B aligned (f8_e4m3 rows are 128 B and
@@ -2561,22 +2586,22 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const bool fused_q = fused_q_candidate && !use_sparse;
     const int fused_K = fused_q ? ggml_cuda_fattn_mma_fused_type_from_ggml(K->type) : FATTN_MMA_FUSED_NONE;
     const int fused_V = fused_q ? ggml_cuda_fattn_mma_fused_type_from_ggml(V->type) : FATTN_MMA_FUSED_NONE;
-    if constexpr ((DKQ == 128 || DKQ == 256 || DKQ == 512) && DV == DKQ && ncols2 == 8) {
+    if constexpr (ggml_cuda_fattn_mma_fused_dkq_compiled(DKQ) && DV == DKQ && ncols2 == 8) {
         // routing pin for tests: with GGML_CUDA_FATTN_MMA_FUSED=2 supported dense ops must reach the fused kernels
-        const bool q_K = ggml_cuda_fattn_mma_fused_type_supported(K->type);
-        const bool q_V = ggml_cuda_fattn_mma_fused_type_supported(V->type);
-        if (ggml_cuda_fattn_mma_f16_fused_q_switch() == 2 && !use_sparse && !fused_q_candidate && q_K && q_V) {
+        const bool q_KV = ggml_cuda_fattn_mma_fused_types_compiled(K->type, V->type);
+        if (ggml_cuda_fattn_mma_f16_fused_q_switch() == 2 && !use_sparse && !fused_q_candidate && q_KV) {
             GGML_ABORT("GGML_CUDA_FATTN_MMA_FUSED=2 but the fused dequant path does not apply");
         }
     }
     if (fused_q) {
-        if constexpr ((DKQ == 128 || DKQ == 256 || DKQ == 512) && DV == DKQ && ncols2 == 8) {
+        if constexpr (ggml_cuda_fattn_mma_fused_dkq_compiled(DKQ) && DV == DKQ && ncols2 == 8) {
             // One linear staging area is reused by the K and V loads in turn, so it is sized by whichever side needs more bytes.
             // At DKQ=DV=256 this holds the full row; at 512 one 256-value chunk, which is the granularity the kernel stages at.
             const size_t nbytes_stage_K = nbatch_fa * (nbatch_K2/16) * ggml_cuda_fattn_mma_fused_block_bytes(fused_K);
             const size_t nbytes_stage_V = nbatch_fa * (nbatch_V2/16) * ggml_cuda_fattn_mma_fused_block_bytes(fused_V);
             nbytes_shared_total += std::max(nbytes_stage_K, nbytes_stage_V); // raw quantized staging area
 
+#ifdef GGML_CUDA_FATTN_MMA_FUSED_ALL
             // Per-side q8_0/q4_0/f8_e4m3 dequant combinations (K x V x softcap), indexed by fused_K/V - 1.
             constexpr fattn_kernel_t fused_kernel_tab[3][3][2] = {
                 { // K q8_0
@@ -2605,6 +2630,13 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 },
             };
             fattn_kernel = fused_kernel_tab[fused_K - 1][fused_V - 1][logit_softcap != 0.0f];
+#else
+            // Compiled set: K q8_0 + V q8_0 only (ggml_cuda_fattn_mma_fused_types_compiled).
+            GGML_ASSERT(fused_K == FATTN_MMA_FUSED_Q8_0 && fused_V == FATTN_MMA_FUSED_Q8_0);
+            fattn_kernel = logit_softcap == 0.0f ?
+                flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, false, FATTN_MMA_FUSED_Q8_0, FATTN_MMA_FUSED_Q8_0> :
+                flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, true,  V_is_K_view, false, FATTN_MMA_FUSED_Q8_0, FATTN_MMA_FUSED_Q8_0>;
+#endif // GGML_CUDA_FATTN_MMA_FUSED_ALL
 
             // Keyed on the kernel address, one raise per (variant, device): the attribute is per-function.
             static uintptr_t fused_kernel_raised[GGML_CUDA_MAX_DEVICES] = {0};
