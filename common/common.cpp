@@ -19,6 +19,7 @@
 #include <climits>
 #include <cmath>
 #include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstring>
 #include <ctime>
@@ -26,11 +27,14 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <random>
 #include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -2411,6 +2415,698 @@ bool common_prompt_batch_decode(
     }
 
     return true;
+}
+
+//
+// host pool
+//
+
+namespace {
+
+struct host_pool_region {
+    ggml_backend_buffer_t buf; // nullptr: plain heap (operator new) or arena, freed on release instead of pooled
+    size_t size;               // real bytes: the size class for pooled regions, 2 MiB multiple for arena regions
+    bool   pinned;
+    common_host_pool_owner owner;
+    std::chrono::steady_clock::time_point t_idle; // when it entered the free list
+    int    arena = -1;         // >= 0: sub-allocated from host_pool::arenas[arena]
+};
+
+// LLAMA_HOST_POOL_RESERVE=1: memory pinned once at startup, sub-allocated with a coalescing free list
+struct host_pool_arena {
+    ggml_backend_buffer_t     buf;
+    uint8_t *                 base;
+    size_t                    size;
+    size_t                    free_bytes;
+    std::map<size_t, size_t>  free_ext; // offset -> size, non-adjacent
+
+    // best fit; returns the offset or SIZE_MAX
+    size_t alloc(size_t need) {
+        auto best = free_ext.end();
+        for (auto it = free_ext.begin(); it != free_ext.end(); ++it) {
+            if (it->second >= need && (best == free_ext.end() || it->second < best->second)) {
+                best = it;
+            }
+        }
+        if (best == free_ext.end()) {
+            return SIZE_MAX;
+        }
+        const size_t off = best->first;
+        const size_t sz  = best->second;
+        free_ext.erase(best);
+        if (sz > need) {
+            free_ext.emplace(off + need, sz - need);
+        }
+        free_bytes -= need;
+        return off;
+    }
+
+    // return an extent, coalescing with its neighbours
+    void free(size_t off, size_t sz) {
+        free_bytes += sz;
+        auto next = free_ext.lower_bound(off);
+        if (next != free_ext.end() && off + sz == next->first) {
+            sz += next->second;
+            next = free_ext.erase(next);
+        }
+        if (next != free_ext.begin()) {
+            auto prev = std::prev(next);
+            if (prev->first + prev->second == off) {
+                prev->second += sz;
+                return;
+            }
+        }
+        free_ext.emplace(off, sz);
+    }
+
+    size_t largest() const {
+        size_t res = 0;
+        for (const auto & e : free_ext) {
+            res = std::max(res, e.second);
+        }
+        return res;
+    }
+};
+
+static size_t host_pool_env(const char * name, size_t def) {
+    const char * val = getenv(name);
+    return val != nullptr && *val != '\0' ? (size_t) strtoull(val, nullptr, 10) : def;
+}
+
+// 8 classes per power of two, at least 2 MiB granularity: <= 12.5% over-allocation
+static size_t host_pool_size_class(size_t n) {
+    size_t p = 1;
+    while (p <= n/2) {
+        p <<= 1;
+    }
+    const size_t step = std::max<size_t>(p/8, 2ull << 20);
+    return (n + step - 1)/step*step;
+}
+
+static thread_local common_host_pool_owner host_pool_scope_owner = COMMON_HOST_POOL_SLOT;
+
+struct host_pool {
+    static constexpr size_t MiB = 1ull << 20;
+    static constexpr int    N   = COMMON_HOST_POOL_N_OWNERS;
+
+    const bool   enabled  = host_pool_env("LLAMA_HOST_POOL", 1) != 0;
+    const size_t min_size = 1*MiB;
+    const size_t idle_s   = host_pool_env("LLAMA_HOST_POOL_IDLE_S", 60);
+
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::thread worker;
+    bool started    = false;
+    bool stop       = false;
+    bool configured = false; // pinning starts with common_host_pool_configure()
+
+    ggml_backend_buffer_type_t buft_pinned = nullptr;
+
+    std::unordered_map<void *, host_pool_region> used;
+    std::multimap<size_t, host_pool_region>      idle; // by size, pooled regions only
+
+    // budget per owner, SIZE_MAX = unlimited: real bytes in use + idle
+    // plain heap bytes count for cache and overflow, not for the slot (pinned) allowance
+    size_t budget     [N] = { SIZE_MAX, SIZE_MAX, 0 };
+    size_t bytes_used [N] = {}; // pooled regions in use
+    size_t bytes_plain[N] = {}; // plain heap allocations in use
+    size_t bytes_idle [N] = {};
+    size_t bytes_pinned  = 0; // used + idle
+
+    uint64_t n_new          = 0; // new pooled regions
+    uint64_t n_new_heap     = 0; // new pooled regions that are not pinned
+    uint64_t n_reuse        = 0;
+    uint64_t n_release      = 0; // idle regions released (expired or for budget)
+    uint64_t n_release_sync = 0; // of those, released on the allocating thread to fit a budget
+    size_t   bytes_release_sync = 0;
+    uint64_t n_slot_heap    = 0; // slot allocations sent to plain heap (over the slot budget)
+    size_t   bytes_slot_heap = 0;
+
+    int64_t  t_slot_heap_log = 0;
+    uint64_t n_slot_heap_log = 0;
+
+    // reserve mode: arenas[0] = cache budget (pinned at configure), arenas[1] = slot allowance (pinned when known)
+    static constexpr size_t arena_gran = 2*MiB;
+    const bool reserve_env  = host_pool_env("LLAMA_HOST_POOL_RESERVE", 0) != 0;
+    bool       reserve      = false; // arenas active
+    bool       reserve_slot = false; // slot arena attempted
+    bool       buft_found   = false;
+    std::vector<host_pool_arena> arenas;
+    size_t   bytes_reserved = 0;
+    uint64_t n_arena_alloc  = 0;
+    uint64_t n_frag         = 0; // arena could not fit a request although enough bytes were free
+    size_t   frag_request   = 0; // last such request
+    size_t   frag_largest   = 0; // largest free extent at that time
+
+    static size_t arena_round(size_t n) {
+        return (n + arena_gran - 1)/arena_gran*arena_gran;
+    }
+
+    // pinned memory only helps discrete GPUs; CPU-only and unified-memory builds use the heap
+    void find_buft() {
+        if (buft_found) {
+            return;
+        }
+        buft_found = true;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            buft_pinned = ggml_backend_dev_host_buffer_type(dev);
+            if (buft_pinned != nullptr) {
+                break;
+            }
+        }
+    }
+
+    // pin one arena; called with mtx held, at startup / first checkpoint only
+    bool arena_add(size_t size, const char * what) {
+        find_buft();
+        if (buft_pinned == nullptr) {
+            LOG_WRN("host pool: LLAMA_HOST_POOL_RESERVE: no GPU host buffer type, cannot reserve the %s arena\n", what);
+            return false;
+        }
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft_pinned, size);
+        if (buf == nullptr || ggml_backend_buffer_get_type(buf) != buft_pinned) {
+            // the CUDA host buffer type falls back to a CPU buffer when pinning fails
+            if (buf != nullptr) {
+                ggml_backend_buffer_free(buf);
+            }
+            LOG_WRN("host pool: LLAMA_HOST_POOL_RESERVE: failed to pin the %s arena of %.1f MiB\n", what, size/(double) MiB);
+            return false;
+        }
+        host_pool_arena a;
+        a.buf        = buf;
+        a.base       = (uint8_t *) ggml_backend_buffer_get_base(buf);
+        a.size       = size;
+        a.free_bytes = size;
+        a.free_ext.emplace(0, size);
+        arenas.push_back(std::move(a));
+        bytes_reserved += size;
+        bytes_pinned   += size;
+        LOG_INF("host pool: reserved %s arena of %.1f MiB (%s); %zu arenas, %.1f MiB reserved in total\n",
+                what, size/(double) MiB, ggml_backend_buft_name(buft_pinned), arenas.size(), bytes_reserved/(double) MiB);
+        return true;
+    }
+
+    // reserve mode allocation, called with the lock held
+    void * alloc_reserve(std::unique_lock<std::mutex> & lock, size_t n, common_host_pool_owner owner) {
+        const size_t need = arena_round(n);
+        // slot allocations use the arenas once the slot arena exists: the budgets then sum to the arena bytes
+        const bool slot_ready = owner != COMMON_HOST_POOL_SLOT || arenas.size() > 1;
+        const char * reason = !slot_ready ? "no slot arena" : "over the slot pinned allowance";
+        if (slot_ready && fits(owner, need, 0)) {
+            // prefer the owner's own arena, then the other
+            const size_t pref = owner == COMMON_HOST_POOL_SLOT && arenas.size() > 1 ? 1 : 0;
+            for (size_t k = 0; k < arenas.size(); k++) {
+                const size_t ai  = (pref + k) % arenas.size();
+                const size_t off = arenas[ai].alloc(need);
+                if (off == SIZE_MAX) {
+                    continue;
+                }
+                void * ptr = arenas[ai].base + off;
+                host_pool_region r = { nullptr, need, true, owner, {} };
+                r.arena = (int) ai;
+                used.emplace(ptr, r);
+                bytes_used[owner] += need;
+                n_arena_alloc++;
+                return ptr;
+            }
+            size_t free_total = 0;
+            size_t largest    = 0;
+            for (const auto & a : arenas) {
+                free_total += a.free_bytes;
+                largest     = std::max(largest, a.largest());
+            }
+            if (free_total >= need) {
+                n_frag++;
+                frag_request = need;
+                frag_largest = largest;
+                reason = "arena fragmented";
+            } else {
+                reason = "arena full";
+            }
+        }
+        if (owner == COMMON_HOST_POOL_CACHE) {
+            throw common_host_pool_over_budget();
+        }
+        n_slot_heap++;
+        bytes_slot_heap += n;
+        log_slot_heap(n, reason);
+        return alloc_plain(lock, n, owner);
+    }
+
+    bool fits(common_host_pool_owner owner, size_t add, size_t credit) const {
+        const size_t plain = owner == COMMON_HOST_POOL_SLOT ? 0 : bytes_plain[owner];
+        return bytes_used[owner] + plain + bytes_idle[owner] - credit + add <= budget[owner];
+    }
+
+    // best fit within one size step (exact class for the slot: its allowance is sized from exact classes);
+    // the newest region of that size so older ones age out
+    std::multimap<size_t, host_pool_region>::iterator find_idle(size_t cls, common_host_pool_owner owner) {
+        auto it = idle.lower_bound(cls);
+        if (it == idle.end() || it->first > (owner == COMMON_HOST_POOL_SLOT ? cls : cls + cls/4)) {
+            return idle.end();
+        }
+        return std::prev(idle.upper_bound(it->first));
+    }
+
+    // release the oldest idle region of an owner, except `keep`; the lock is dropped during the free
+    bool release_oldest(std::unique_lock<std::mutex> & lock, common_host_pool_owner owner, const void * keep) {
+        auto victim = idle.end();
+        for (auto it = idle.begin(); it != idle.end(); ++it) {
+            if (it->second.owner != owner || ggml_backend_buffer_get_base(it->second.buf) == keep) {
+                continue;
+            }
+            if (victim == idle.end() || it->second.t_idle < victim->second.t_idle) {
+                victim = it;
+            }
+        }
+        if (victim == idle.end()) {
+            return false;
+        }
+        release(lock, victim);
+        return true;
+    }
+
+    void release(std::unique_lock<std::mutex> & lock, std::multimap<size_t, host_pool_region>::iterator it) {
+        host_pool_region r = it->second;
+        idle.erase(it);
+        bytes_idle[r.owner] -= r.size;
+
+        lock.unlock();
+        ggml_backend_buffer_free(r.buf);
+        lock.lock();
+
+        if (r.pinned) {
+            bytes_pinned -= r.size;
+        }
+        n_release++;
+    }
+
+    void * alloc(size_t n) {
+        if (!enabled || n < min_size) {
+            return ::operator new(n);
+        }
+
+        const common_host_pool_owner owner = host_pool_scope_owner;
+
+        std::unique_lock<std::mutex> lock(mtx);
+        if (!started) {
+            start();
+        }
+
+        if (owner == COMMON_HOST_POOL_OVERFLOW) {
+            // plain heap, bounded by its own budget, never pooled
+            if (!fits(owner, n, 0)) {
+                throw common_host_pool_over_budget();
+            }
+            return alloc_plain(lock, n, owner);
+        }
+
+        if (reserve) {
+            return alloc_reserve(lock, n, owner);
+        }
+
+        const size_t cls = host_pool_size_class(n);
+
+        // make the allocation fit the owner's budget: release idle regions of that owner, oldest first
+        bool reuse = true;
+        auto it = find_idle(cls, owner);
+        for (;;) {
+            const size_t add    = it != idle.end() ? it->first : cls;
+            const size_t credit = it != idle.end() && it->second.owner == owner ? it->first : 0;
+            if (fits(owner, add, credit)) {
+                break;
+            }
+            const void * keep = it != idle.end() ? ggml_backend_buffer_get_base(it->second.buf) : nullptr;
+            const size_t idle_before = bytes_idle[owner];
+            if (!release_oldest(lock, owner, keep)) {
+                if (it != idle.end()) {
+                    // a fresh region of exactly the size class may still fit
+                    reuse = false;
+                    it = idle.end();
+                    continue;
+                }
+                if (owner == COMMON_HOST_POOL_CACHE) {
+                    throw common_host_pool_over_budget();
+                }
+                // slot: over its pinned allowance, use plain heap
+                n_slot_heap++;
+                bytes_slot_heap += n;
+                log_slot_heap(n, "over the slot pinned allowance");
+                return alloc_plain(lock, n, owner);
+            }
+            n_release_sync++;
+            bytes_release_sync += idle_before - bytes_idle[owner];
+            it = reuse ? find_idle(cls, owner) : idle.end(); // the lock was dropped
+        }
+
+        if (it != idle.end()) {
+            host_pool_region r = it->second;
+            idle.erase(it);
+            bytes_idle[r.owner] -= r.size;
+            r.owner = owner;
+            bytes_used[owner] += r.size;
+            n_reuse++;
+            void * ptr = ggml_backend_buffer_get_base(r.buf);
+            used.emplace(ptr, r);
+            return ptr;
+        }
+
+        // new region: account first, allocate without holding the lock (cudaMallocHost is slow)
+        // cache regions are pinned only when the cache has a finite budget
+        const bool want_pinned = configured && buft_pinned != nullptr &&
+            (owner == COMMON_HOST_POOL_SLOT || budget[COMMON_HOST_POOL_CACHE] != SIZE_MAX);
+        bytes_used[owner] += cls;
+        if (want_pinned) {
+            bytes_pinned += cls;
+        }
+        lock.unlock();
+
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(want_pinned ? buft_pinned : ggml_backend_cpu_buffer_type(), cls);
+        // the CUDA host buffer type falls back to a CPU buffer when pinning fails
+        const bool pinned = buf != nullptr && want_pinned && ggml_backend_buffer_get_type(buf) == buft_pinned;
+
+        lock.lock();
+        if (want_pinned && !pinned) {
+            bytes_pinned -= cls;
+        }
+        if (buf == nullptr) {
+            bytes_used[owner] -= cls;
+            throw std::bad_alloc();
+        }
+
+        host_pool_region r = { buf, cls, pinned, owner, {} };
+        void * ptr = ggml_backend_buffer_get_base(buf);
+        used.emplace(ptr, r);
+        n_new++;
+        n_new_heap += pinned ? 0 : 1;
+        return ptr;
+    }
+
+    // called with the lock held, returns with it held
+    void * alloc_plain(std::unique_lock<std::mutex> & lock, size_t n, common_host_pool_owner owner) {
+        bytes_plain[owner] += n;
+        lock.unlock();
+        void * ptr = nullptr;
+        try {
+            ptr = ::operator new(n);
+        } catch (...) {
+            lock.lock();
+            bytes_plain[owner] -= n;
+            throw;
+        }
+        lock.lock();
+        used.emplace(ptr, host_pool_region{ nullptr, n, false, owner, {} });
+        return ptr;
+    }
+
+    void log_slot_heap(size_t n, const char * reason) {
+        const int64_t t_now = ggml_time_us();
+        if (t_now - t_slot_heap_log >= 10*1000*1000) {
+            LOG_INF("host pool: slot allocation of %.1f MiB -> heap: %s (slot pinned allowance %.1f MiB)"
+                    " (%" PRIu64 " since last log, %" PRIu64 " total, %.1f MiB total)\n",
+                    n/(double) MiB, reason, budget[COMMON_HOST_POOL_SLOT]/(double) MiB,
+                    n_slot_heap - n_slot_heap_log, n_slot_heap, bytes_slot_heap/(double) MiB);
+            t_slot_heap_log = t_now;
+            n_slot_heap_log = n_slot_heap;
+        }
+    }
+
+    void dealloc(void * ptr, size_t n) {
+        if (!enabled || n < min_size) {
+            ::operator delete(ptr);
+            return;
+        }
+
+        std::unique_lock<std::mutex> lock(mtx);
+
+        auto it = used.find(ptr);
+        GGML_ASSERT(it != used.end() && "host pool: unknown pointer");
+        host_pool_region r = it->second;
+        used.erase(it);
+
+        if (r.arena >= 0) {
+            bytes_used[r.owner] -= r.size;
+            arenas[r.arena].free((uint8_t *) ptr - arenas[r.arena].base, r.size);
+            return;
+        }
+
+        if (r.buf == nullptr) {
+            bytes_plain[r.owner] -= r.size;
+            lock.unlock();
+            ::operator delete(ptr);
+            return;
+        }
+
+        bytes_used[r.owner] -= r.size;
+
+        if (stop) {
+            // process exit: the GPU runtime may already be torn down, leave the memory to the OS
+            return;
+        }
+
+        r.t_idle = std::chrono::steady_clock::now();
+        idle.emplace(r.size, r);
+        bytes_idle[r.owner] += r.size;
+    }
+
+    size_t usable_size(const void * ptr, size_t n) {
+        if (!enabled || n < min_size) {
+            return n;
+        }
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = used.find(const_cast<void *>(ptr));
+        return it != used.end() ? it->second.size : n;
+    }
+
+    void set_owner(const void * ptr, size_t n, common_host_pool_owner owner) {
+        if (!enabled || n < min_size) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = used.find(const_cast<void *>(ptr));
+        if (it == used.end() || it->second.owner == owner || it->second.owner == COMMON_HOST_POOL_OVERFLOW) {
+            return;
+        }
+        size_t * bytes = it->second.buf != nullptr || it->second.arena >= 0 ? bytes_used : bytes_plain;
+        bytes[it->second.owner] -= it->second.size;
+        bytes[owner]            += it->second.size;
+        it->second.owner = owner;
+    }
+
+    bool trim(common_host_pool_owner owner) {
+        if (!enabled) {
+            return true;
+        }
+        std::unique_lock<std::mutex> lock(mtx);
+        while (!fits(owner, 0, 0)) {
+            const size_t idle_before = bytes_idle[owner];
+            if (!release_oldest(lock, owner, nullptr)) {
+                return false;
+            }
+            n_release_sync++;
+            bytes_release_sync += idle_before - bytes_idle[owner];
+        }
+        return true;
+    }
+
+    // called with mtx held, on the first pooled allocation (backends are loaded by then)
+    void start() {
+        started = true;
+
+        find_buft();
+
+        LOG_INF("host pool: %s memory%s, %s\n",
+                buft_pinned ? ggml_backend_buft_name(buft_pinned) : "heap",
+                configured ? "" : " (heap until configured)",
+                reserve ? "reserved arenas" : string_format("idle release %zu s", idle_s).c_str());
+
+        worker = std::thread([this] { run(); });
+
+        // join the worker before static destruction tears down the GPU runtime
+        static struct stopper {
+            host_pool * pool;
+            ~stopper() {
+                {
+                    std::lock_guard<std::mutex> lock(pool->mtx);
+                    pool->stop = true;
+                }
+                pool->cv.notify_all();
+                pool->worker.join();
+            }
+        } s = { this };
+    }
+
+    // background release of expired idle regions: off the server main loop, and the lock is not
+    // held during ggml_backend_buffer_free (cudaFreeHost / munmap of a large region can take 100+ ms)
+    void run() {
+        using clock = std::chrono::steady_clock;
+
+        auto     t_log = clock::now();
+        uint64_t n_log = 0;
+
+        std::unique_lock<std::mutex> lock(mtx);
+        while (!stop) {
+            cv.wait_for(lock, std::chrono::seconds(1));
+
+            while (!stop && !idle.empty()) {
+                auto victim = idle.begin();
+                for (auto it = idle.begin(); it != idle.end(); ++it) {
+                    if (it->second.t_idle < victim->second.t_idle) {
+                        victim = it;
+                    }
+                }
+                if (clock::now() - victim->second.t_idle < std::chrono::seconds(idle_s)) {
+                    break;
+                }
+                const size_t size   = victim->second.size;
+                const bool   pinned = victim->second.pinned;
+                release(lock, victim);
+                LOG_DBG("host pool: released idle %s region of %.1f MiB\n", pinned ? "pinned" : "heap", size/(double) MiB);
+            }
+
+            // stats, at most every 5 minutes and only when something changed
+            const uint64_t n_events = n_new + n_reuse + n_release + n_slot_heap + n_arena_alloc;
+            if (n_events != n_log && clock::now() - t_log >= std::chrono::minutes(5)) {
+                LOG_INF("host pool: new %" PRIu64 " (heap %" PRIu64 "), reused %" PRIu64 ", released %" PRIu64 " (%" PRIu64 " for budget)"
+                        ", arena allocs %" PRIu64 " (fragmented %" PRIu64 "), slot->heap %" PRIu64
+                        ", MiB used/idle: slot %.1f/%.1f, cache %.1f/%.1f, overflow %.1f, pinned %.1f MiB\n",
+                        n_new, n_new_heap, n_reuse, n_release, n_release_sync, n_arena_alloc, n_frag, n_slot_heap,
+                        (bytes_used[COMMON_HOST_POOL_SLOT]  + bytes_plain[COMMON_HOST_POOL_SLOT]) /(double) MiB, bytes_idle[COMMON_HOST_POOL_SLOT] /(double) MiB,
+                        (bytes_used[COMMON_HOST_POOL_CACHE] + bytes_plain[COMMON_HOST_POOL_CACHE])/(double) MiB, bytes_idle[COMMON_HOST_POOL_CACHE]/(double) MiB,
+                        bytes_plain[COMMON_HOST_POOL_OVERFLOW]/(double) MiB, bytes_pinned/(double) MiB);
+                n_log = n_events;
+                t_log = clock::now();
+            }
+        }
+    }
+};
+
+// never destroyed: buffers may be freed during static destruction
+static host_pool & host_pool_get() {
+    static host_pool * pool = new host_pool();
+    return *pool;
+}
+
+} // namespace
+
+void * common_host_pool_alloc(size_t size) {
+    return host_pool_get().alloc(size);
+}
+
+void common_host_pool_free(void * ptr, size_t size) {
+    host_pool_get().dealloc(ptr, size);
+}
+
+bool common_host_pool_enabled() {
+    return host_pool_get().enabled;
+}
+
+void common_host_pool_configure(size_t cache_bytes, size_t overflow_bytes) {
+    host_pool & pool = host_pool_get();
+    std::lock_guard<std::mutex> lock(pool.mtx);
+    pool.configured = true;
+    pool.budget[COMMON_HOST_POOL_CACHE]    = cache_bytes;
+    pool.budget[COMMON_HOST_POOL_OVERFLOW] = overflow_bytes;
+
+    if (!pool.enabled || !pool.reserve_env || pool.reserve) {
+        return;
+    }
+    if (cache_bytes == 0 || cache_bytes == SIZE_MAX) {
+        LOG_WRN("%s", "host pool: LLAMA_HOST_POOL_RESERVE needs a finite --cache-ram, not reserving\n");
+        return;
+    }
+    // the cache budget becomes the arena size (rounded down to the arena granularity)
+    const size_t size = cache_bytes/host_pool::arena_gran*host_pool::arena_gran;
+    if (pool.arena_add(size, "cache")) {
+        pool.reserve = true;
+        pool.budget[COMMON_HOST_POOL_CACHE] = size;
+    } else {
+        LOG_WRN("%s", "host pool: LLAMA_HOST_POOL_RESERVE: falling back to on-demand pinned regions\n");
+    }
+}
+
+void common_host_pool_set_budget(common_host_pool_owner owner, size_t bytes) {
+    host_pool & pool = host_pool_get();
+    std::lock_guard<std::mutex> lock(pool.mtx);
+    pool.budget[owner] = bytes;
+
+    // reserve mode: the slot allowance becomes the second arena, pinned once
+    if (owner == COMMON_HOST_POOL_SLOT && pool.reserve && !pool.reserve_slot && bytes > 0) {
+        pool.reserve_slot = true;
+        const size_t size = host_pool::arena_round(bytes);
+        if (pool.arena_add(size, "slot")) {
+            pool.budget[owner] = size;
+        } else {
+            LOG_WRN("%s", "host pool: LLAMA_HOST_POOL_RESERVE: slot checkpoints use plain heap\n");
+        }
+    }
+}
+
+size_t common_host_pool_size_class(size_t size) {
+    host_pool & pool = host_pool_get();
+    if (!pool.enabled || size < pool.min_size) {
+        return size;
+    }
+    std::lock_guard<std::mutex> lock(pool.mtx);
+    return pool.reserve ? host_pool::arena_round(size) : host_pool_size_class(size);
+}
+
+size_t common_host_pool_usable_size(const void * ptr, size_t size) {
+    return host_pool_get().usable_size(ptr, size);
+}
+
+void common_host_pool_set_owner(const void * ptr, size_t size, common_host_pool_owner owner) {
+    host_pool_get().set_owner(ptr, size, owner);
+}
+
+bool common_host_pool_trim(common_host_pool_owner owner) {
+    return host_pool_get().trim(owner);
+}
+
+common_host_pool_stats common_host_pool_get_stats() {
+    host_pool & pool = host_pool_get();
+    std::lock_guard<std::mutex> lock(pool.mtx);
+    common_host_pool_stats res;
+    for (int i = 0; i < COMMON_HOST_POOL_N_OWNERS; i++) {
+        res.used[i]   = pool.bytes_used[i] + pool.bytes_plain[i];
+        res.idle[i]   = pool.bytes_idle[i];
+        res.budget[i] = pool.budget[i];
+    }
+    res.pinned             = pool.bytes_pinned;
+    res.n_release_sync     = pool.n_release_sync;
+    res.bytes_release_sync = pool.bytes_release_sync;
+    res.reserved           = pool.bytes_reserved;
+    res.n_frag             = pool.n_frag;
+    res.frag_request       = pool.frag_request;
+    res.frag_largest       = pool.frag_largest;
+    return res;
+}
+
+common_host_pool_owner common_host_pool_set_scope(common_host_pool_owner owner) {
+    const common_host_pool_owner prev = host_pool_scope_owner;
+    host_pool_scope_owner = owner;
+    return prev;
+}
+
+size_t common_state_data_bytes(const common_state_data & data) {
+    return data.capacity() > 0 ? common_host_pool_usable_size(data.data(), data.capacity()) : 0;
+}
+
+void common_prompt_checkpoint_set_owner(const common_prompt_checkpoint & ckpt, common_host_pool_owner owner) {
+    if (ckpt.data_tgt.capacity() > 0) {
+        common_host_pool_set_owner(ckpt.data_tgt.data(), ckpt.data_tgt.capacity(), owner);
+    }
+    if (ckpt.data_dft.capacity() > 0) {
+        common_host_pool_set_owner(ckpt.data_dft.data(), ckpt.data_dft.capacity(), owner);
+    }
+}
+
+size_t common_prompt_checkpoint::real_size() const {
+    return common_state_data_bytes(data_tgt) + common_state_data_bytes(data_dft) + data_spec.capacity();
 }
 
 size_t common_prompt_checkpoint::size() const {
