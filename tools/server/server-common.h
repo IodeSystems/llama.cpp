@@ -600,6 +600,15 @@ struct server_prefix_ckpt_metrics {
     uint64_t n_cache_copies     = 0; // prompt cache entries copied (not moved) into a slot for their pinned prefix
 };
 
+// parallel per-slot target sampling (corrallm p8, LLAMA_PAR_SAMPLING)
+struct server_par_sampling_metrics {
+    bool     enabled  = false;
+    uint64_t n_steps  = 0; // decode steps whose sampling ran on the pool (>= 2 slots)
+    uint64_t n_jobs   = 0; // slot sampling tasks run on the pool
+    uint64_t t_wall_us = 0; // wall time of target sampling + accept, all steps
+    uint64_t t_work_us = 0; // summed per-slot sampling time (the serial cost); t_work - t_wall = time saved
+};
+
 struct server_metrics {
     int64_t t_start = 0;
 
@@ -650,6 +659,9 @@ struct server_metrics {
 
     // pinned prefix checkpoint counters, filled by server_context when the metrics are read
     server_prefix_ckpt_metrics prefix_ckpt;
+
+    // parallel sampling counters, filled by server_context when the metrics are read
+    server_par_sampling_metrics par_sampling;
 
     void init() {
         t_start = ggml_time_us();
