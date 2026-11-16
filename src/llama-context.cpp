@@ -959,6 +959,12 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
+    // nothing evaluated since the last sync: return without writing the counters below, so that concurrent
+    // synchronize() + output getter calls from several threads only read the context (corrallm p8)
+    if (n_queued_tokens == 0 && t_compute_start_us == 0) {
+        return;
+    }
+
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
@@ -2813,6 +2819,11 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 }
 
 void llama_context::output_reorder() {
+    // already in order: no writes, see synchronize() (corrallm p8)
+    if (output_swaps.empty() && embd_batch_idxs.empty()) {
+        return;
+    }
+
     const uint64_t n_vocab     = model.vocab.n_tokens();
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
