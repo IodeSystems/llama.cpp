@@ -3373,6 +3373,8 @@ void common_prompt_checkpoint::clear() {
     pos_min = 0;
     pos_max = 0;
 
+    pin = PIN_NONE;
+
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
