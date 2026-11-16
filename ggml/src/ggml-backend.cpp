@@ -2489,10 +2489,11 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
     }
-    if (!sched->is_alloc) {
+    if (!sched->is_alloc && sched->next_copy != 0) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
         // this ensures that during generation the same copy is used every time,
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
+        // (only written when it changes, so that concurrent synchronizations do not race - corrallm p8)
         sched->next_copy = 0;
     }
 }
