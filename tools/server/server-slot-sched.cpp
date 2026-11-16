@@ -5,6 +5,8 @@
 #include "log.h"
 
 #include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
 
 //
 // server_prompt
@@ -68,8 +70,15 @@ server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, int32_t n_unshift
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
+    // entries share checkpoints (with slots and with each other): count each once
+    std::unordered_set<const common_prompt_checkpoint *> seen;
     for (const auto & state : states) {
-        res += state.size();
+        res += state.data.size();
+        for (const auto & ckpt : state.prompt.checkpoints) {
+            if (seen.insert(ckpt.get()).second) {
+                res += ckpt->real_size();
+            }
+        }
     }
 
     return res;
@@ -139,6 +148,15 @@ void server_prompt_cache::log_overflow(const char * what, size_t bytes) {
     n_ovf_frag0         = st.n_frag;
 }
 
+// eviction preference under a policy: higher goes first
+static double server_prompt_cache_score(common_cache_ram_policy policy, const server_prompt_cache_state & state, int64_t t_now, size_t pos) {
+    if (policy == COMMON_CACHE_RAM_POLICY_FIFO) {
+        return -(double) pos;
+    }
+    const double age = (double) std::max<int64_t>(0, t_now - state.t_last_used);
+    return policy == COMMON_CACHE_RAM_POLICY_LRU ? age : age / (1.0 + state.prompt.n_hits);
+}
+
 std::list<server_prompt_cache_state>::iterator server_prompt_cache::victim() {
     GGML_ASSERT(!states.empty());
 
@@ -151,12 +169,85 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::victim() {
     // ties go to the entry nearest the front (oldest saved)
     auto   res       = states.begin();
     double score_res = -1.0;
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const double age   = (double) std::max<int64_t>(0, t_now - it->t_last_used);
-        const double score = policy == COMMON_CACHE_RAM_POLICY_LRU ? age : age / (1.0 + it->prompt.n_hits);
+    size_t pos       = 0;
+    for (auto it = states.begin(); it != states.end(); ++it, ++pos) {
+        const double score = server_prompt_cache_score(policy, *it, t_now, pos);
         if (score > score_res) {
             score_res = score;
             res       = it;
+        }
+    }
+
+    return res;
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::victim_hole(size_t size) {
+    GGML_ASSERT(!states.empty());
+
+    const int64_t t_now = ggml_time_us();
+
+    // policy order, ties to the front (stable sort)
+    std::vector<std::pair<double, std::list<server_prompt_cache_state>::iterator>> order;
+    size_t pos = 0;
+    for (auto it = states.begin(); it != states.end(); ++it, ++pos) {
+        order.emplace_back(server_prompt_cache_score(policy, *it, t_now, pos), it);
+    }
+    std::stable_sort(order.begin(), order.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+
+    for (const auto & [score, it] : order) {
+        // what evicting the entry frees: its state buffers and the checkpoints nothing else holds
+        std::vector<const void *> freed;
+        for (const auto * buf : { &it->data.main, &it->data.drft }) {
+            if (buf->capacity() > 0) {
+                freed.push_back(buf->data());
+            }
+        }
+        for (const auto & ckpt : it->prompt.checkpoints) {
+            if (ckpt.use_count() == 1) {
+                for (const auto * buf : { &ckpt->data_tgt, &ckpt->data_dft }) {
+                    if (buf->capacity() > 0) {
+                        freed.push_back(buf->data());
+                    }
+                }
+            }
+        }
+        if (common_host_pool_largest_if_freed(freed) >= size) {
+            return it;
+        }
+    }
+
+    return victim();
+}
+
+std::vector<const void *> server_prompt_cache::movable_blocks() const {
+    std::vector<const void *> res;
+
+    // a checkpoint is the cache's alone if every reference to it is held by cache entries
+    std::unordered_map<const common_prompt_checkpoint *, long> refs;
+    for (const auto & state : states) {
+        for (const auto & ckpt : state.prompt.checkpoints) {
+            refs[ckpt.get()]++;
+        }
+    }
+
+    std::unordered_set<const common_prompt_checkpoint *> seen;
+    for (const auto & state : states) {
+        if (!state.data.overflow) {
+            for (const auto * buf : { &state.data.main, &state.data.drft }) {
+                if (buf->capacity() > 0) {
+                    res.push_back(buf->data());
+                }
+            }
+        }
+        for (const auto & ckpt : state.prompt.checkpoints) {
+            if (ckpt.use_count() != refs[ckpt.get()] || !seen.insert(ckpt.get()).second) {
+                continue;
+            }
+            for (const auto * buf : { &ckpt->data_tgt, &ckpt->data_dft }) {
+                if (buf->capacity() > 0) {
+                    res.push_back(buf->data());
+                }
+            }
         }
     }
 
@@ -175,6 +266,19 @@ server_prompt_cache_metrics server_prompt_cache::get_metrics() const {
     res.enabled   = true;
     res.n_entries = states.size();
     res.n_bytes   = size();
+
+    if (common_host_pool_enabled()) {
+        const auto st = common_host_pool_get_stats();
+        res.n_compactions         = st.n_compact;
+        res.n_compactions_skipped = st.n_compact_skipped;
+        res.bytes_compacted       = st.bytes_compact;
+        res.compaction_s          = st.t_compact_us / 1e6;
+        res.n_arenas              = st.n_arenas;
+        for (int i = 0; i < 2; i++) {
+            res.arena_free[i]    = st.arena_free[i];
+            res.arena_largest[i] = st.arena_largest[i];
+        }
+    }
 
     return res;
 }
@@ -247,8 +351,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     // by the pool: an allocation over budget first releases idle cache regions (oldest first),
     // then throws common_host_pool_over_budget and we evict the oldest entry and retry
     // (oldest = the policy's victim; one call = one counted eviction)
-    const auto evict_oldest = [&](server_prompt_cache_evict_reason reason) {
-        const auto it = victim();
+    const auto evict_oldest = [&](server_prompt_cache_evict_reason reason, size_t hole) {
+        // fragmentation: prefer the entry whose blocks (and the free space around them) make the hole
+        const auto it = reason == SERVER_PROMPT_CACHE_EVICT_FRAGMENTATION ? victim_hole(hole) : victim();
         n_ovf_evicted++;
         bytes_ovf_evicted += it->size();
         SRV_TRC(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
@@ -282,8 +387,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             if (states.empty()) {
                 throw common_host_pool_over_budget();
             }
-            evict_oldest(SERVER_PROMPT_CACHE_EVICT_BUDGET);
+            evict_oldest(SERVER_PROMPT_CACHE_EVICT_BUDGET, 0);
         }
+
+        // one free extent for both state buffers
+        const size_t hole = common_host_pool_size_class(state_size_tgt) + common_host_pool_size_class(state_size_dft);
+        bool compacted = false; // this attempt follows a compaction
 
         for (;;) {
             // the pool counts arena requests that failed although enough bytes were free
@@ -301,6 +410,15 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
                 frag = pool && common_host_pool_get_stats().n_frag != n_frag0;
             }
 
+            // fragmented: move blocks only the cache holds before evicting anything
+            if (frag && !compacted) {
+                compacted = common_host_pool_compact(hole, movable_blocks());
+                if (compacted) {
+                    continue;
+                }
+            }
+            compacted = false;
+
             if (overflow_heap) {
                 try {
                     common_host_pool_scope scope(COMMON_HOST_POOL_OVERFLOW);
@@ -317,7 +435,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             if (states.empty()) {
                 throw common_host_pool_over_budget();
             }
-            evict_oldest(frag ? SERVER_PROMPT_CACHE_EVICT_FRAGMENTATION : SERVER_PROMPT_CACHE_EVICT_BUDGET);
+            evict_oldest(frag ? SERVER_PROMPT_CACHE_EVICT_FRAGMENTATION : SERVER_PROMPT_CACHE_EVICT_BUDGET, hole);
         }
     } catch (const common_host_pool_over_budget &) {
         ckpts_to_slot();

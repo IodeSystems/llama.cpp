@@ -2430,6 +2430,7 @@ struct host_pool_region {
     common_host_pool_owner owner;
     std::chrono::steady_clock::time_point t_idle; // when it entered the free list
     int    arena = -1;         // >= 0: sub-allocated from host_pool::arenas[arena]
+    void ** handle = nullptr;  // arena regions: the owner's pointer to the block, for compaction
 };
 
 // LLAMA_HOST_POOL_RESERVE=1: memory pinned once at startup, sub-allocated with a coalescing free list
@@ -2557,6 +2558,13 @@ struct host_pool {
     uint64_t n_frag         = 0; // arena could not fit a request although enough bytes were free
     size_t   frag_request   = 0; // last such request
     size_t   frag_largest   = 0; // largest free extent at that time
+
+    // compaction of the cache arena (arenas[0])
+    const size_t compact_max = host_pool_env("LLAMA_HOST_POOL_COMPACT_MAX_MIB", 4096)*MiB; // bytes moved per call
+    uint64_t n_compact         = 0;
+    uint64_t n_compact_skipped = 0;
+    size_t   bytes_compact     = 0;
+    int64_t  t_compact_us      = 0;
 
     static size_t arena_round(size_t n) {
         return (n + arena_gran - 1)/arena_gran*arena_gran;
@@ -2913,6 +2921,154 @@ struct host_pool {
         return true;
     }
 
+    void set_handle(const void * ptr, size_t n, void ** handle) {
+        if (!enabled || n < min_size) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = used.find(const_cast<void *>(ptr));
+        if (it != used.end() && it->second.arena >= 0) {
+            it->second.handle = handle;
+        }
+    }
+
+    // Compaction moves blocks of the cache arena with memmove while holding the lock. It is safe because
+    //  - only blocks the caller lists move: the prompt cache lists its entries' state buffers and the
+    //    checkpoints no slot holds, all owned by the server thread that calls this
+    //  - no copy to or from them is in flight: every host<->device copy of state data returns only after
+    //    cudaStreamSynchronize (ggml-cuda.cu buffer set/get_tensor[_n], batch-get.cu ggml_cuda_get_tensor_n),
+    //    and the pinned memory stays registered, as the block stays inside the same pinned arena
+    //  - each block's owner pointer is rewritten through its registered handle (common_state_data)
+    bool compact(size_t n, const std::vector<const void *> & movable) {
+        if (!enabled) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!reserve || arenas.empty()) {
+            return false;
+        }
+        host_pool_arena & a = arenas[0];
+        const size_t need = arena_round(n);
+        if (a.largest() >= need) {
+            return true;
+        }
+        if (a.free_bytes < need || compact_max == 0) {
+            n_compact_skipped++;
+            return false;
+        }
+
+        const std::unordered_set<const void *> mov(movable.begin(), movable.end());
+
+        struct seg {
+            size_t off;
+            size_t size;
+            void * ptr;     // nullptr: free extent
+            bool   movable;
+        };
+        std::vector<seg> segs;
+        segs.reserve(used.size() + a.free_ext.size());
+        for (const auto & [p, r] : used) {
+            if (r.arena == 0) {
+                segs.push_back({ (size_t) ((uint8_t *) p - a.base), r.size, p, r.handle != nullptr && mov.count(p) > 0 });
+            }
+        }
+        for (const auto & [off, sz] : a.free_ext) {
+            segs.push_back({ off, sz, nullptr, true });
+        }
+        std::sort(segs.begin(), segs.end(), [](const seg & x, const seg & y) { return x.off < y.off; });
+
+        // fewest bytes to move: for each right end the shortest window (largest left end) with enough free
+        // bytes; windows never contain a block that cannot move
+        size_t best_l = SIZE_MAX, best_r = 0, best_mv = SIZE_MAX;
+        size_t l = 0, fr = 0, mv = 0;
+        for (size_t r = 0; r < segs.size(); r++) {
+            if (!segs[r].movable) {
+                l  = r + 1;
+                fr = mv = 0;
+                continue;
+            }
+            (segs[r].ptr ? mv : fr) += segs[r].size;
+            while (l < r && fr - (segs[l].ptr ? 0 : segs[l].size) >= need) {
+                (segs[l].ptr ? mv : fr) -= segs[l].size;
+                l++;
+            }
+            if (fr >= need && mv < best_mv) {
+                best_l  = l;
+                best_r  = r;
+                best_mv = mv;
+            }
+        }
+        if (best_l == SIZE_MAX || best_mv > compact_max) {
+            n_compact_skipped++;
+            LOG_DBG("host pool: not compacting for a %.1f MiB request: %s (cache arena free %.1f MiB, largest %.1f MiB)\n",
+                    need/(double) MiB, best_l == SIZE_MAX ? "no window of movable blocks" :
+                    string_format("would move %.1f MiB, cap %.1f MiB", best_mv/(double) MiB, compact_max/(double) MiB).c_str(),
+                    a.free_bytes/(double) MiB, a.largest()/(double) MiB);
+            return false;
+        }
+
+        // slide the window's blocks down to its start, in address order: one free extent at its end
+        const int64_t t_start = ggml_time_us();
+        size_t cur = segs[best_l].off;
+        size_t window_free = 0;
+        for (size_t i = best_l; i <= best_r; i++) {
+            const seg & sg = segs[i];
+            if (sg.ptr == nullptr) {
+                a.free_ext.erase(sg.off);
+                a.free_bytes -= sg.size;
+                window_free  += sg.size;
+                continue;
+            }
+            if (sg.off != cur) {
+                uint8_t * dst = a.base + cur;
+                std::memmove(dst, a.base + sg.off, sg.size);
+                auto it = used.find(sg.ptr);
+                GGML_ASSERT(it != used.end());
+                host_pool_region r = it->second;
+                used.emplace(dst, r); // before erase: a throw here leaves the old entry valid
+                used.erase(sg.ptr);   // by key: emplace may rehash and invalidate `it`
+                *r.handle = dst;
+            }
+            cur += sg.size;
+        }
+        GGML_ASSERT(cur + window_free == segs[best_r].off + segs[best_r].size);
+        a.free(cur, window_free);
+        const int64_t t_us = ggml_time_us() - t_start;
+
+        n_compact++;
+        bytes_compact += best_mv;
+        t_compact_us  += t_us;
+        GGML_ASSERT(a.largest() >= need);
+        LOG_INF("host pool: compacted the cache arena for a %.1f MiB request: moved %.1f MiB in %.1f ms (%.1f GB/s), largest free %.1f MiB\n",
+                need/(double) MiB, best_mv/(double) MiB, t_us/1e3, t_us > 0 ? best_mv/(t_us*1e3) : 0.0, a.largest()/(double) MiB);
+        return true;
+    }
+
+    size_t largest_if_freed(const std::vector<const void *> & ptrs) {
+        if (!enabled) {
+            return 0;
+        }
+        std::lock_guard<std::mutex> lock(mtx);
+        size_t res = 0;
+        for (size_t ai = 0; ai < arenas.size(); ai++) {
+            std::vector<std::pair<size_t, size_t>> ext(arenas[ai].free_ext.begin(), arenas[ai].free_ext.end());
+            for (const void * p : ptrs) {
+                auto it = used.find(const_cast<void *>(p));
+                if (it != used.end() && it->second.arena == (int) ai) {
+                    ext.emplace_back((const uint8_t *) p - arenas[ai].base, it->second.size);
+                }
+            }
+            std::sort(ext.begin(), ext.end());
+            size_t run_end = 0, run = 0;
+            for (const auto & [off, sz] : ext) {
+                run     = off == run_end ? run + sz : sz;
+                run_end = off + sz;
+                res     = std::max(res, run);
+            }
+        }
+        return res;
+    }
+
     // called with mtx held, on the first pooled allocation (backends are loaded by then)
     void start() {
         started = true;
@@ -3083,6 +3239,15 @@ common_host_pool_stats common_host_pool_get_stats() {
     res.n_frag             = pool.n_frag;
     res.frag_request       = pool.frag_request;
     res.frag_largest       = pool.frag_largest;
+    res.n_compact          = pool.n_compact;
+    res.n_compact_skipped  = pool.n_compact_skipped;
+    res.bytes_compact      = pool.bytes_compact;
+    res.t_compact_us       = pool.t_compact_us;
+    res.n_arenas           = (int) std::min<size_t>(2, pool.arenas.size());
+    for (int i = 0; i < 2; i++) {
+        res.arena_free[i]    = i < res.n_arenas ? pool.arenas[i].free_bytes : 0;
+        res.arena_largest[i] = i < res.n_arenas ? pool.arenas[i].largest()  : 0;
+    }
     return res;
 }
 
@@ -3090,6 +3255,91 @@ common_host_pool_owner common_host_pool_set_scope(common_host_pool_owner owner) 
     const common_host_pool_owner prev = host_pool_scope_owner;
     host_pool_scope_owner = owner;
     return prev;
+}
+
+void common_host_pool_set_handle(const void * ptr, size_t size, void ** handle) {
+    host_pool_get().set_handle(ptr, size, handle);
+}
+
+bool common_host_pool_compact(size_t size, const std::vector<const void *> & movable) {
+    return host_pool_get().compact(size, movable);
+}
+
+size_t common_host_pool_largest_if_freed(const std::vector<const void *> & ptrs) {
+    return host_pool_get().largest_if_freed(ptrs);
+}
+
+//
+// common_state_data
+//
+
+common_state_data::common_state_data(const common_state_data & other) {
+    *this = other;
+}
+
+common_state_data::common_state_data(common_state_data && other) noexcept {
+    *this = std::move(other);
+}
+
+common_state_data::~common_state_data() {
+    release();
+}
+
+common_state_data & common_state_data::operator=(const common_state_data & other) {
+    if (this != &other) {
+        common_state_data tmp;
+        tmp.resize(other.n);
+        if (other.n > 0) {
+            memcpy(tmp.ptr, other.ptr, other.n);
+        }
+        *this = std::move(tmp);
+    }
+    return *this;
+}
+
+common_state_data & common_state_data::operator=(common_state_data && other) noexcept {
+    if (this != &other) {
+        release();
+        ptr = other.ptr;
+        n   = other.n;
+        cap = other.cap;
+        other.ptr = nullptr;
+        other.n   = 0;
+        other.cap = 0;
+        if (ptr != nullptr) {
+            common_host_pool_set_handle(ptr, cap, (void **) &ptr);
+        }
+    }
+    return *this;
+}
+
+void common_state_data::resize(size_t n_new) {
+    if (n_new > cap) {
+        uint8_t * p = (uint8_t *) common_host_pool_alloc(n_new);
+        if (n > 0) {
+            memcpy(p, ptr, n);
+        }
+        release();
+        ptr = p;
+        cap = n_new;
+        common_host_pool_set_handle(ptr, cap, (void **) &ptr);
+    }
+    n = n_new;
+}
+
+void common_state_data::shrink_to_fit() {
+    if (n == 0) {
+        release();
+    }
+}
+
+void common_state_data::release() {
+    if (ptr != nullptr) {
+        common_host_pool_free(ptr, cap);
+    }
+    ptr = nullptr;
+    n   = 0;
+    cap = 0;
 }
 
 size_t common_state_data_bytes(const common_state_data & data) {

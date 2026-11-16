@@ -1664,8 +1664,29 @@ std::string server_task_result_metrics::to_metrics() {
         });
         add_items("gauge", {
             { "prompt_cache_entries", "Number of prompt cache entries", (double) pc.n_entries },
-            { "prompt_cache_bytes",   "Prompt cache size in bytes (real allocated, checkpoints shared by entries counted per entry)", (double) pc.n_bytes },
+            { "prompt_cache_bytes",   "Prompt cache size in bytes (real allocated, a checkpoint shared by entries counted once)", (double) pc.n_bytes },
         });
+
+        if (pc.n_arenas > 0) {
+            add_items("counter", {
+                { "prompt_cache_compactions_total", "Host pool cache arena compactions (blocks moved to make one free extent instead of evicting)", (double) pc.n_compactions },
+                { "prompt_cache_compactions_skipped_total", "Fragmented saves that did not compact: no window of movable blocks, or over LLAMA_HOST_POOL_COMPACT_MAX_MIB", (double) pc.n_compactions_skipped },
+                { "prompt_cache_compaction_bytes_moved_total", "Bytes moved by host pool cache arena compactions", (double) pc.bytes_compacted },
+                { "prompt_cache_compaction_seconds_total", "Time spent moving bytes in host pool cache arena compactions", pc.compaction_s },
+            });
+
+            static const char * arenas[2] = { "cache", "slot" };
+            prometheus << "# HELP llamacpp:host_pool_arena_free_bytes Free bytes per host pool arena (LLAMA_HOST_POOL_RESERVE)\n"
+                       << "# TYPE llamacpp:host_pool_arena_free_bytes gauge\n";
+            for (int i = 0; i < pc.n_arenas; i++) {
+                prometheus << "llamacpp:host_pool_arena_free_bytes{arena=\"" << arenas[i] << "\"} " << pc.arena_free[i] << "\n";
+            }
+            prometheus << "# HELP llamacpp:host_pool_arena_largest_free_bytes Largest free extent per host pool arena (LLAMA_HOST_POOL_RESERVE)\n"
+                       << "# TYPE llamacpp:host_pool_arena_largest_free_bytes gauge\n";
+            for (int i = 0; i < pc.n_arenas; i++) {
+                prometheus << "llamacpp:host_pool_arena_largest_free_bytes{arena=\"" << arenas[i] << "\"} " << pc.arena_largest[i] << "\n";
+            }
+        }
 
         static const char * reasons[SERVER_PROMPT_CACHE_EVICT_N_REASONS] = { "budget", "fragmentation", "tokens", "superseded" };
         prometheus << "# HELP llamacpp:prompt_cache_evictions_total Prompt cache entries removed, by reason\n"

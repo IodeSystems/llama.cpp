@@ -121,7 +121,7 @@ struct server_prompt_cache {
     size_t   bytes_ovf_rel_sync0 = 0;
     uint64_t n_ovf_frag0     = 0; // host pool arena fragmentation count at the last log
 
-    // real allocated bytes (checkpoints shared by several entries are counted per entry)
+    // real allocated bytes (a checkpoint shared by several entries is counted once)
     size_t size() const;
     size_t size_overflow() const;
 
@@ -132,6 +132,13 @@ struct server_prompt_cache {
 
     // the entry to evict next under the policy (states must not be empty)
     std::list<server_prompt_cache_state>::iterator victim();
+
+    // host pool fragmentation: the first entry in policy order whose eviction leaves a free extent of
+    // `size` bytes, or victim() if none does
+    std::list<server_prompt_cache_state>::iterator victim_hole(size_t size);
+
+    // blocks only the cache holds: entry state buffers and checkpoints no slot shares
+    std::vector<const void *> movable_blocks() const;
 
     // erase an entry to make room (or a superseded one) and count it; returns the next entry
     std::list<server_prompt_cache_state>::iterator evict(std::list<server_prompt_cache_state>::iterator it, server_prompt_cache_evict_reason reason);
