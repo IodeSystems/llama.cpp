@@ -1357,6 +1357,13 @@ struct common_host_pool_stats {
     uint64_t n_frag;             // arena requests that failed although enough bytes were free
     size_t   frag_request;       // last such request
     size_t   frag_largest;       // largest free extent at that time
+    uint64_t n_compact;          // compactions of the cache arena (common_host_pool_compact)
+    uint64_t n_compact_skipped;  // compactions not done: no window of movable blocks, or over the move cap
+    size_t   bytes_compact;      // bytes moved by compactions
+    int64_t  t_compact_us;       // time spent moving
+    int      n_arenas;           // LLAMA_HOST_POOL_RESERVE arenas: 0 = cache, 1 = slot
+    size_t   arena_free   [2];   // free bytes per arena
+    size_t   arena_largest[2];   // largest free extent per arena
 };
 
 void * common_host_pool_alloc(size_t size);
@@ -1379,6 +1386,21 @@ common_host_pool_stats common_host_pool_get_stats();
 
 // owner of allocations made on this thread; returns the previous one
 common_host_pool_owner common_host_pool_set_scope(common_host_pool_owner owner);
+
+// relocatable allocations (LLAMA_HOST_POOL_RESERVE arenas only, no-op otherwise): *handle is the owner's
+// pointer to the block; common_host_pool_compact() may move the block and then writes the new address there
+void   common_host_pool_set_handle(const void * ptr, size_t size, void ** handle);
+
+// make one free extent of at least `size` bytes in the cache arena by moving blocks (memmove):
+// the address window with the fewest bytes to move whose free bytes reach `size`, containing only
+// blocks listed in `movable` that have a handle; at most LLAMA_HOST_POOL_COMPACT_MAX_MIB (default 4096,
+// 0 = never compact) moved per call. Call only when no listed block is in use, on the thread that
+// owns them; host<->device copies of state buffers are synchronous, see the implementation
+// returns true if the cache arena now has a free extent of `size` bytes
+bool   common_host_pool_compact(size_t size, const std::vector<const void *> & movable);
+
+// largest free extent of any arena if the listed blocks were freed (0 without arenas)
+size_t common_host_pool_largest_if_freed(const std::vector<const void *> & ptrs);
 
 struct common_host_pool_scope {
     common_host_pool_owner prev;
@@ -1403,8 +1425,39 @@ struct common_no_init_allocator : std::allocator<T> {
     template <typename U> void construct(U * p) { ::new ((void *) p) U; }
 };
 
-// sequence state data, filled by llama_state_seq_get_data_ext()
-using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
+// sequence state data, filled by llama_state_seq_get_data_ext(); memory comes from the host pool
+// a byte buffer with the std::vector calls used here, but relocatable: it registers the address of its
+// pointer with the host pool, so compaction can move the block and fix the pointer. Do not keep data()
+// across a prompt cache save. Grown bytes are left uninitialized.
+struct common_state_data {
+    common_state_data() = default;
+    common_state_data(const common_state_data & other);
+    common_state_data(common_state_data && other) noexcept;
+    ~common_state_data();
+
+    common_state_data & operator=(const common_state_data & other);
+    common_state_data & operator=(common_state_data && other) noexcept;
+
+    uint8_t *       data()       { return ptr; }
+    const uint8_t * data() const { return ptr; }
+
+    size_t size()     const { return n; }
+    size_t capacity() const { return cap; }
+    bool   empty()    const { return n == 0; }
+
+    // keeps the first min(size(), n_new) bytes; throws (the buffer unchanged) if the pool cannot allocate
+    void resize(size_t n_new);
+    void clear() { n = 0; }
+    // frees the block when empty
+    void shrink_to_fit();
+
+private:
+    void release();
+
+    uint8_t * ptr = nullptr;
+    size_t    n   = 0;
+    size_t    cap = 0;
+};
 
 // real allocated bytes of a state buffer
 size_t common_state_data_bytes(const common_state_data & data);
