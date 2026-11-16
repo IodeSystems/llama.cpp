@@ -467,8 +467,33 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
             break;
         }
 
-        if (!prepare(ubatches)) {
+        bool rs_hazard = false;
+        if (!prepare(ubatches, n_rs_seq > 0 ? &rs_hazard : nullptr)) {
             break;
+        }
+
+        if (rs_hazard) {
+            // a later ubatch would overwrite the rollback snapshots of a seq from an earlier one:
+            // split by sequence instead, a ubatch of one seq never moves another seq's cell
+            LLAMA_LOG_DEBUG("%s: rollback snapshots would be overwritten, splitting by sequence\n", __func__);
+
+            balloc.split_reset();
+            ubatches.clear();
+            while (true) {
+                llama_ubatch ubatch = balloc.split_seq(n_ubatch);
+                if (ubatch.n_tokens == 0) {
+                    break;
+                }
+                ubatches.push_back(std::move(ubatch)); // NOLINT
+            }
+
+            if (balloc.get_n_used() < balloc.get_n_tokens()) {
+                break;
+            }
+
+            if (!prepare(ubatches)) {
+                break;
+            }
         }
 
         return std::make_unique<llama_memory_recurrent_context>(this, std::move(ubatches));
@@ -488,7 +513,7 @@ llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lct
     return std::make_unique<llama_memory_recurrent_context>(LLAMA_MEMORY_STATUS_NO_UPDATE);
 }
 
-bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches) {
+bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches, bool * rs_hazard) {
     // simply remember the full state because it is very small for this type of cache
     // TODO: optimize
     auto org_cells = cells;
@@ -497,10 +522,27 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 
     bool success = true;
 
+    // seqs of the ubatches simulated so far
+    std::vector<bool> seen(rs_hazard ? size : 0, false);
+
     for (const auto & ubatch : ubatches) {
         if (!find_slot(ubatch)) {
             success = false;
             break;
+        }
+
+        if (rs_hazard) {
+            for (const llama_seq_id seq_id : rs_displaced) {
+                if (seen[seq_id]) {
+                    *rs_hazard = true;
+                }
+            }
+            for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+                const uint32_t i = s*ubatch.n_seq_tokens;
+                for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                    seen[ubatch.seq_id[i][j]] = true;
+                }
+            }
         }
     }
 
@@ -635,6 +677,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     }
 
     // gather and re-order
+    rs_displaced.clear();
+    std::vector<int32_t> moved; // cells that received the content of another cell
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const uint32_t i = s*n_seq_tokens;
         const int32_t dst_id = s + min;
@@ -646,6 +690,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
+            // rs_max describes the snapshots of the content, so it moves with it (corrallm)
+            std::swap(dst_cell.rs_max, src_cell.rs_max);
+            moved.push_back(src_id);
 
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
@@ -656,6 +703,29 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                     tail = src_id;
                 }
             }
+        }
+    }
+
+    // a cell moved out of the way of this ubatch keeps its state (copied via src), but its rollback snapshots stay
+    // at the old index, where this ubatch writes its own: it can no longer roll back (corrallm)
+    for (const int32_t cell_id : moved) {
+        auto & cell = cells[cell_id];
+        if (cell.rs_max == 0 || cell.seq_id.empty()) {
+            continue;
+        }
+        bool in_ubatch = false;
+        for (uint32_t s = 0; s < n_seqs && !in_ubatch; ++s) {
+            const uint32_t i = s*n_seq_tokens;
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                if (cell.has_seq_id(ubatch.seq_id[i][j])) {
+                    in_ubatch = true;
+                    break;
+                }
+            }
+        }
+        if (!in_ubatch) {
+            cell.rs_max = 0;
+            rs_displaced.insert(rs_displaced.end(), cell.seq_id.begin(), cell.seq_id.end());
         }
     }
 
