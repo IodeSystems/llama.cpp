@@ -139,13 +139,56 @@ void server_prompt_cache::log_overflow(const char * what, size_t bytes) {
     n_ovf_frag0         = st.n_frag;
 }
 
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::victim() {
+    GGML_ASSERT(!states.empty());
+
+    if (policy == COMMON_CACHE_RAM_POLICY_FIFO) {
+        return states.begin();
+    }
+
+    const int64_t t_now = ggml_time_us();
+
+    // ties go to the entry nearest the front (oldest saved)
+    auto   res       = states.begin();
+    double score_res = -1.0;
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const double age   = (double) std::max<int64_t>(0, t_now - it->t_last_used);
+        const double score = policy == COMMON_CACHE_RAM_POLICY_LRU ? age : age / (1.0 + it->prompt.n_hits);
+        if (score > score_res) {
+            score_res = score;
+            res       = it;
+        }
+    }
+
+    return res;
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::evict(std::list<server_prompt_cache_state>::iterator it, server_prompt_cache_evict_reason reason) {
+    metrics.add_evicted(reason, std::max<int64_t>(0, ggml_time_us() - it->t_last_used) / 1e6);
+
+    return erase_state(it);
+}
+
+server_prompt_cache_metrics server_prompt_cache::get_metrics() const {
+    server_prompt_cache_metrics res = metrics;
+
+    res.enabled   = true;
+    res.n_entries = states.size();
+    res.n_bytes   = size();
+
+    return res;
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+    const int64_t t_now = ggml_time_us();
+
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+            it->t_last_used = t_now; // the slot was still using it
             return nullptr;
         }
     }
@@ -169,6 +212,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    // the new entry continues the history of the prompts it supersedes
+    int64_t  t_created = prompt.t_created > 0 ? prompt.t_created : t_now;
+    uint32_t n_hits    = prompt.n_hits;
+
     // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -176,7 +223,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
-            it = erase_state(it);
+            t_created = std::min(t_created, it->prompt.t_created);
+            n_hits    = std::max(n_hits,    it->prompt.n_hits);
+
+            it = evict(it, SERVER_PROMPT_CACHE_EVICT_SUPERSEDED);
         } else {
             ++it;
         }
@@ -185,22 +235,25 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0 && !pool) {
         // no host pool: make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
+            const auto it = victim();
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+                    it->size() / (1024.0 * 1024.0));
 
-            erase_state(states.begin());
+            evict(it, SERVER_PROMPT_CACHE_EVICT_BUDGET);
         }
     }
 
     // with the host pool, the cache budget (limit_size) is enforced on real bytes, in use + idle,
     // by the pool: an allocation over budget first releases idle cache regions (oldest first),
     // then throws common_host_pool_over_budget and we evict the oldest entry and retry
-    const auto evict_oldest = [&]() {
+    // (oldest = the policy's victim; one call = one counted eviction)
+    const auto evict_oldest = [&](server_prompt_cache_evict_reason reason) {
+        const auto it = victim();
         n_ovf_evicted++;
-        bytes_ovf_evicted += states.front().size();
+        bytes_ovf_evicted += it->size();
         SRV_TRC(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                states.front().size() / (1024.0 * 1024.0));
-        erase_state(states.begin());
+                it->size() / (1024.0 * 1024.0));
+        evict(it, reason);
     };
 
     // the entry's checkpoints are counted by the cache from now on
@@ -229,10 +282,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             if (states.empty()) {
                 throw common_host_pool_over_budget();
             }
-            evict_oldest();
+            evict_oldest(SERVER_PROMPT_CACHE_EVICT_BUDGET);
         }
 
         for (;;) {
+            // the pool counts arena requests that failed although enough bytes were free
+            const uint64_t n_frag0 = pool ? common_host_pool_get_stats().n_frag : 0;
+            bool frag = false;
             try {
                 common_host_pool_scope scope(COMMON_HOST_POOL_CACHE);
                 state_data_tgt.resize(state_size_tgt);
@@ -242,6 +298,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
                 state_data_tgt = common_state_data();
                 state_data_dft = common_state_data();
                 over = true;
+                frag = pool && common_host_pool_get_stats().n_frag != n_frag0;
             }
 
             if (overflow_heap) {
@@ -260,7 +317,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             if (states.empty()) {
                 throw common_host_pool_over_budget();
             }
-            evict_oldest();
+            evict_oldest(frag ? SERVER_PROMPT_CACHE_EVICT_FRAGMENTATION : SERVER_PROMPT_CACHE_EVICT_BUDGET);
         }
     } catch (const common_host_pool_over_budget &) {
         ckpts_to_slot();
@@ -292,12 +349,15 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
+            /*.t_created   =*/ t_created,
+            /*.n_hits      =*/ n_hits,
         },
         /*.data   =*/ {
             /*.main     =*/ std::move(state_data_tgt),
             /*.drft     =*/ std::move(state_data_dft),
             /*.overflow =*/ overflow,
         },
+        /*.t_last_used =*/ t_now,
     });
 
     if (pool && common_host_pool_get_stats().n_release_sync != n_release_sync0) {
@@ -326,6 +386,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     auto it_best = states.end();
 
+    // the most similar cached prompt regardless of the slot's own prompt (for the recency refresh)
+    auto  it_match    = states.end();
+    float f_sim_match = 0.0f;
+
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
@@ -340,6 +404,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
+        if (lcp_cur > 0 && f_sim_match < f_sim_cur) {
+            f_sim_match = f_sim_cur;
+            it_match    = it;
+        }
+
         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
@@ -349,8 +418,27 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    if (it_best == states.end()) {
+        metrics.n_misses++;
+
+        if (it_match != states.end()) {
+            // the slot keeps a better prompt, but the entry matched: it is still in use
+            metrics.n_matched++;
+            it_match->t_last_used = ggml_time_us();
+        }
+
+        // the slot's prompt is about to be replaced by an unrelated one: do not carry its history over
+        if (f_keep_best < 0.5f) {
+            prompt.t_created = 0;
+            prompt.n_hits    = 0;
+        }
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+
+        // a failed restore below is a miss (the caller clears the slot)
+        metrics.n_misses++;
 
         {
             auto & data = it_best->data.main;
@@ -394,6 +482,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         prompt = std::move(it_best->prompt);
+        prompt.n_hits++;
+
+        metrics.n_misses--;
+        metrics.n_hits++;
 
         states.erase(it_best);
 
@@ -410,9 +502,10 @@ void server_prompt_cache::update() {
     if (limit_size > 0) {
         // overflow entries are bounded by limit_overflow, everything else by limit_size
         while (!states.empty() && (size() - size_overflow() > limit_size || size_overflow() > limit_overflow)) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            const auto it = victim();
+            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", it->size() / (1024.0 * 1024.0));
 
-            erase_state(states.begin());
+            evict(it, SERVER_PROMPT_CACHE_EVICT_BUDGET);
         }
     }
 
@@ -424,10 +517,11 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
+            const auto it = victim();
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+                    limit_tokens, limit_tokens_cur, it->size() / (1024.0 * 1024.0));
 
-            erase_state(states.begin());
+            evict(it, SERVER_PROMPT_CACHE_EVICT_TOKENS);
         }
     }
 

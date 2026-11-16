@@ -24,9 +24,15 @@ struct server_prompt {
     // a checkpoint does not change after it is created, so the prompt cache shares it with the slot instead of a copy
     std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
 
+    // prompt cache bookkeeping, carried from a cache entry into the slot and back on the next save
+    int64_t  t_created = 0; // us, first save of this prompt to the cache (0 = never saved)
+    uint32_t n_hits    = 0; // times the cache restored this prompt into a slot
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        t_created = 0;
+        n_hits    = 0;
     }
 
     int n_tokens() const {
@@ -37,6 +43,8 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            t_created,
+            n_hits,
         };
     }
 
@@ -64,6 +72,8 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    int64_t t_last_used = 0; // us, last save, load or match of this entry
+
     size_t size() const {
         size_t res = data.size();
 
@@ -76,7 +86,8 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, common_cache_ram_policy policy = COMMON_CACHE_RAM_POLICY_FIFO) {
+        this->policy       = policy;
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
     }
@@ -88,6 +99,12 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // which entry to evict first
+    common_cache_ram_policy policy = COMMON_CACHE_RAM_POLICY_FIFO;
+
+    // counters for /metrics (gauges are filled by get_metrics())
+    server_prompt_cache_metrics metrics;
 
     // --cache-overflow heap: entries beyond limit_size go to plain heap, up to limit_overflow bytes
     bool   overflow_heap  = false;
@@ -112,6 +129,14 @@ struct server_prompt_cache {
     std::list<server_prompt_cache_state>::iterator erase_state(std::list<server_prompt_cache_state>::iterator it);
 
     void log_overflow(const char * what, size_t bytes);
+
+    // the entry to evict next under the policy (states must not be empty)
+    std::list<server_prompt_cache_state>::iterator victim();
+
+    // erase an entry to make room (or a superseded one) and count it; returns the next entry
+    std::list<server_prompt_cache_state>::iterator evict(std::list<server_prompt_cache_state>::iterator it, server_prompt_cache_evict_reason reason);
+
+    server_prompt_cache_metrics get_metrics() const;
 
     size_t n_tokens() const;
 

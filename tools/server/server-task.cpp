@@ -440,6 +440,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"id", oaicompat_cmpl_id}
     };
 
+    // not in the OpenAI API: the slot that served the request
+    res["id_slot"] = id_slot;
+
     // extra fields for debugging purposes
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
@@ -508,6 +511,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     if (stats.is_set()) {
         deltas.back()["timings"] = stats.to_json();
     }
+
+    // not in the OpenAI API: the slot that served the request
+    deltas.back()["id_slot"] = id_slot;
 
     // extra fields for debugging purposes
     if (verbose && !deltas.empty()) {
@@ -1646,6 +1652,39 @@ std::string server_task_result_metrics::to_metrics() {
 
     add_items("counter", counters);
     add_items("gauge",   gauges);
+
+    // prompt cache (--cache-ram)
+    if (metrics.cache.enabled) {
+        const auto & pc = metrics.cache;
+
+        add_items("counter", {
+            { "prompt_cache_hits_total",    "Prompt cache loads that restored a cached prompt into a slot", (double) pc.n_hits },
+            { "prompt_cache_misses_total",  "Prompt cache loads that restored nothing (no usable entry, the slot's prompt was better, or the restore failed)", (double) pc.n_misses },
+            { "prompt_cache_matches_kept_total", "Prompt cache misses where an entry matched but the slot's own prompt was better (the entry's last use is refreshed)", (double) pc.n_matched },
+        });
+        add_items("gauge", {
+            { "prompt_cache_entries", "Number of prompt cache entries", (double) pc.n_entries },
+            { "prompt_cache_bytes",   "Prompt cache size in bytes (real allocated, checkpoints shared by entries counted per entry)", (double) pc.n_bytes },
+        });
+
+        static const char * reasons[SERVER_PROMPT_CACHE_EVICT_N_REASONS] = { "budget", "fragmentation", "tokens", "superseded" };
+        prometheus << "# HELP llamacpp:prompt_cache_evictions_total Prompt cache entries removed, by reason\n"
+                   << "# TYPE llamacpp:prompt_cache_evictions_total counter\n";
+        for (int i = 0; i < SERVER_PROMPT_CACHE_EVICT_N_REASONS; i++) {
+            prometheus << "llamacpp:prompt_cache_evictions_total{reason=\"" << reasons[i] << "\"} " << pc.n_evicted[i] << "\n";
+        }
+
+        prometheus << "# HELP llamacpp:prompt_cache_evicted_age_seconds Time since last use of prompt cache entries evicted to make room (budget, fragmentation, tokens)\n"
+                   << "# TYPE llamacpp:prompt_cache_evicted_age_seconds histogram\n";
+        uint64_t n_cum = 0;
+        for (int i = 0; i < server_prompt_cache_metrics::N_AGE_BUCKETS; i++) {
+            n_cum += pc.n_age_bucket[i];
+            prometheus << "llamacpp:prompt_cache_evicted_age_seconds_bucket{le=\"" << server_prompt_cache_metrics::AGE_BUCKETS[i] << "\"} " << n_cum << "\n";
+        }
+        prometheus << "llamacpp:prompt_cache_evicted_age_seconds_bucket{le=\"+Inf\"} " << pc.n_age << "\n"
+                   << "llamacpp:prompt_cache_evicted_age_seconds_sum " << pc.age_sum << "\n"
+                   << "llamacpp:prompt_cache_evicted_age_seconds_count " << pc.n_age << "\n";
+    }
 
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {

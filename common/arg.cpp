@@ -1730,6 +1730,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_OVERFLOW_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-ram-policy"}, "{fifo,lru,weighted}",
+        "which prompt cache entry to evict first when the cache is full:\n"
+        "fifo     - the oldest saved entry (default)\n"
+        "lru      - the least recently used entry (a load or a match refreshes it)\n"
+        "weighted - the entry with the largest (time since last use) / (1 + hits)",
+        [](common_params & params, const std::string & value) {
+            if (value == "fifo") {
+                params.cache_ram_policy = COMMON_CACHE_RAM_POLICY_FIFO;
+            } else if (value == "lru") {
+                params.cache_ram_policy = COMMON_CACHE_RAM_POLICY_LRU;
+            } else if (value == "weighted") {
+                params.cache_ram_policy = COMMON_CACHE_RAM_POLICY_WEIGHTED;
+            } else {
+                throw std::invalid_argument("invalid value for --cache-ram-policy: " + value);
+            }
+        }
+    ).set_env("LLAMA_ARG_CACHE_RAM_POLICY").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
