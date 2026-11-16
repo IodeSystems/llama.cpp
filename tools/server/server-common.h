@@ -505,6 +505,53 @@ struct server_slot_stats {
     json to_json() const;
 };
 
+// prompt cache (--cache-ram) counters, cumulative since the cache was created
+enum server_prompt_cache_evict_reason {
+    SERVER_PROMPT_CACHE_EVICT_BUDGET        = 0, // over the byte budget (--cache-ram / --cache-overflow-max)
+    SERVER_PROMPT_CACHE_EVICT_FRAGMENTATION = 1, // host pool arena fragmented: enough bytes free, no extent large enough
+    SERVER_PROMPT_CACHE_EVICT_TOKENS        = 2, // over the token limit
+    SERVER_PROMPT_CACHE_EVICT_SUPERSEDED    = 3, // a prefix of a newly saved prompt
+    SERVER_PROMPT_CACHE_EVICT_N_REASONS     = 4,
+};
+
+struct server_prompt_cache_metrics {
+    // upper bounds in seconds of the evicted-entry age histogram (time since last use), +Inf implied
+    static constexpr int    N_AGE_BUCKETS = 7;
+    static constexpr double AGE_BUCKETS[N_AGE_BUCKETS] = { 10, 60, 300, 900, 3600, 21600, 86400 };
+
+    bool enabled = false; // a prompt cache exists
+
+    // gauges, set when the metrics are read
+    uint64_t n_entries = 0;
+    uint64_t n_bytes   = 0; // real allocated bytes
+
+    uint64_t n_hits    = 0; // load() restored a cached entry into the slot
+    uint64_t n_misses  = 0; // load() found no usable entry (or the restore failed)
+    uint64_t n_matched = 0; // load() found an entry but the slot's own prompt was better (counted in n_misses too)
+
+    uint64_t n_evicted[SERVER_PROMPT_CACHE_EVICT_N_REASONS] = {};
+
+    // evictions to make room (budget, fragmentation, tokens), not superseded entries
+    uint64_t n_age_bucket[N_AGE_BUCKETS] = {}; // non-cumulative: bucket i counts ages in (AGE_BUCKETS[i-1], AGE_BUCKETS[i]]
+    uint64_t n_age = 0;
+    double   age_sum = 0.0; // seconds
+
+    void add_evicted(server_prompt_cache_evict_reason reason, double age_s) {
+        n_evicted[reason]++;
+        if (reason == SERVER_PROMPT_CACHE_EVICT_SUPERSEDED) {
+            return;
+        }
+        n_age++;
+        age_sum += age_s;
+        for (int i = 0; i < N_AGE_BUCKETS; i++) {
+            if (age_s <= AGE_BUCKETS[i]) {
+                n_age_bucket[i]++;
+                break;
+            }
+        }
+    }
+};
+
 // shared between server_context_impl and server_task_result_*
 // unlike server_slot_stats, server_metrics is server-global and cumulative, not tied to a slot
 struct server_metrics {
@@ -548,6 +595,9 @@ struct server_metrics {
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
+
+    // snapshot of the prompt cache counters, filled by server_context when the metrics are read
+    server_prompt_cache_metrics cache;
 
     void init() {
         t_start = ggml_time_us();
