@@ -1709,6 +1709,22 @@ std::string server_task_result_metrics::to_metrics() {
                    << "llamacpp:prompt_cache_evicted_age_seconds_count " << pc.n_age << "\n";
     }
 
+    // cross-slot KV reuse (LLAMA_XSLOT=1)
+    if (metrics.xslot.enabled) {
+        const auto & xs = metrics.xslot;
+
+        add_items("counter", {
+            { "xslot_attach_total",        "Requests started from another slot's cells (cross-slot KV reuse)", (double) xs.n_attach },
+            { "xslot_tokens_reused_total", "Usable prefix tokens of the requests started from another slot's cells", (double) xs.n_tokens },
+        });
+
+        prometheus << "# HELP llamacpp:xslot_skipped_total Requests where another slot held a longer usable prefix but was not attached, by reason\n"
+                   << "# TYPE llamacpp:xslot_skipped_total counter\n";
+        for (int i = 0; i < SERVER_XSLOT_SKIP_N_REASONS; i++) {
+            prometheus << "llamacpp:xslot_skipped_total{reason=\"" << server_xslot_skip_reason_str((server_xslot_skip_reason) i) << "\"} " << xs.n_skipped[i] << "\n";
+        }
+    }
+
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
         prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
@@ -2220,6 +2236,32 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     return &states.back();
+}
+
+const server_prompt * server_prompt_cache::peek(const server_prompt & prompt, const server_tokens & tokens_new) const {
+    // same selection as load()
+    const int lcp_base = prompt.tokens.get_common_prefix(tokens_new);
+
+    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_base) / prompt.tokens.size() : -1.0f;
+    float f_sim_best  = float(lcp_base) / tokens_new.size();
+
+    const server_prompt * res = nullptr;
+    for (const auto & state : states) {
+        const int lcp_cur = state.prompt.tokens.get_common_prefix(tokens_new);
+
+        const float f_keep_cur = float(lcp_cur) / state.prompt.tokens.size();
+        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+
+        if (f_keep_cur < 0.25f) {
+            continue;
+        }
+        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+            f_keep_best = f_keep_cur;
+            f_sim_best  = f_sim_cur;
+            res = &state.prompt;
+        }
+    }
+    return res;
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {

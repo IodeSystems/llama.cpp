@@ -811,6 +811,9 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
+    // the entry load() would restore for a slot holding `prompt`, without restoring it (nullptr = none)
+    const server_prompt * peek(const server_prompt & prompt, const server_tokens & tokens_new) const;
+
     void update();
 };
 

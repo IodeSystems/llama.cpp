@@ -563,6 +563,33 @@ struct server_prompt_cache_metrics {
 
 // shared between server_context_impl and server_task_result_*
 // unlike server_slot_stats, server_metrics is server-global and cumulative, not tied to a slot
+// cross-slot KV reuse (corrallm xslot, LLAMA_XSLOT=1): requests where another slot held a longer usable prefix
+enum server_xslot_skip_reason {
+    SERVER_XSLOT_SKIP_SOURCE_STARTING = 0, // the source slot had not reconciled its tokens yet (simultaneous arrival)
+    SERVER_XSLOT_SKIP_BELOW_MIN       = 1, // prefix shorter than LLAMA_XSLOT_MIN
+    SERVER_XSLOT_SKIP_HOST_CACHE      = 2, // the prompt cache entry resumes further
+    SERVER_XSLOT_SKIP_NOT_UNIFIED     = 3, // needs --kv-unified
+    SERVER_XSLOT_SKIP_SWA             = 4, // sliding-window attention
+    SERVER_XSLOT_SKIP_CTX_SHIFT       = 5, // --context-shift moves cells in place
+    SERVER_XSLOT_SKIP_CACHE_REUSE     = 6, // n_cache_reuse moves cells in place
+    SERVER_XSLOT_SKIP_LORA            = 7, // adapters
+    SERVER_XSLOT_SKIP_N_REASONS       = 8,
+};
+
+static inline const char * server_xslot_skip_reason_str(server_xslot_skip_reason r) {
+    static const char * names[SERVER_XSLOT_SKIP_N_REASONS] = {
+        "source_starting", "below_min", "host_cache", "not_unified", "swa", "ctx_shift", "cache_reuse", "lora",
+    };
+    return names[r];
+}
+
+struct server_xslot_metrics {
+    bool     enabled  = false;
+    uint64_t n_attach = 0; // requests started from another slot's cells
+    uint64_t n_tokens = 0; // usable prefix tokens at attach
+    uint64_t n_skipped[SERVER_XSLOT_SKIP_N_REASONS] = {};
+};
+
 struct server_metrics {
     int64_t t_start = 0;
 
@@ -607,6 +634,9 @@ struct server_metrics {
 
     // snapshot of the prompt cache counters, filled by server_context when the metrics are read
     server_prompt_cache_metrics cache;
+
+    // cross-slot KV reuse counters, filled by server_context when the metrics are read
+    server_xslot_metrics xslot;
 
     void init() {
         t_start = ggml_time_us();
