@@ -33,6 +33,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <unordered_set>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -1084,6 +1085,11 @@ public:
         }
         res.xslot = xslot_metrics;
         res.xslot.enabled = xslot_enabled;
+        res.prefix_ckpt = prefix_ckpt_metrics;
+        res.prefix_ckpt.enabled = prefix_ckpt_enabled;
+        if (prompt_cache) {
+            res.prefix_ckpt.n_cache_copies = prompt_cache->n_prefix_copies;
+        }
         return res;
     }
 
@@ -1625,6 +1631,10 @@ private:
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.cache_ram_policy);
 
+            prompt_cache->prefix_ckpt     = prefix_ckpt_enabled;
+            prompt_cache->ckpt_limited    = ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+            prompt_cache->prefix_ckpt_min = prefix_ckpt_min;
+
             if (prompt_cache->limit_size > 0) {
                 prompt_cache->overflow_heap  = params_base.cache_overflow_heap && common_host_pool_enabled();
                 prompt_cache->limit_overflow = !prompt_cache->overflow_heap ? 0 :
@@ -1847,6 +1857,17 @@ private:
     const int64_t xslot_min_tokens = getenv("LLAMA_XSLOT_MIN") ? atoll(getenv("LLAMA_XSLOT_MIN")) : 256;
 
     server_xslot_metrics xslot_metrics;
+
+    // corrallm p7: pinned prefix checkpoints, LLAMA_PREFIX_CKPT=1 enables (default off). The checkpoint at the start
+    // of the first user message (the end of the system+tools prefix) is evicted last from a slot's checkpoint list,
+    // so a cache entry or slot still resumes a new conversation that shares only that prefix.
+    // LLAMA_PREFIX_CKPT_MIN: smallest prefix worth pinning (default 256 tokens).
+    // LLAMA_PREFIX_CKPT_BOUNDARIES=N: also keep up to N checkpoints at earlier user-message starts, spread (default 0)
+    const bool    prefix_ckpt_enabled    = getenv("LLAMA_PREFIX_CKPT") && atoi(getenv("LLAMA_PREFIX_CKPT")) != 0;
+    const int64_t prefix_ckpt_min        = getenv("LLAMA_PREFIX_CKPT_MIN") ? atoll(getenv("LLAMA_PREFIX_CKPT_MIN")) : 256;
+    const int     prefix_ckpt_boundaries = getenv("LLAMA_PREFIX_CKPT_BOUNDARIES") ? std::max(0, atoi(getenv("LLAMA_PREFIX_CKPT_BOUNDARIES"))) : 0;
+
+    server_prefix_ckpt_metrics prefix_ckpt_metrics;
 
     // tokens of `tokens` that the memory behind prompt `p` can resume from: the common prefix for attention-only
     // memory; with recurrent state, the whole prefix only if it covers the full state, else the latest checkpoint
@@ -2913,6 +2934,18 @@ private:
             return c.second != id_task || c.first.expired();
         }), slot.ckpt_claims.end());
 
+        // p7: the pin of a checkpoint at this position
+        uint8_t pin_new = common_prompt_checkpoint::PIN_NONE;
+        if (prefix_ckpt_enabled) {
+            const auto & spans = slot.task->params.message_spans;
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            if (n_tokens_new == spans.first_user_message_pos() && n_tokens_new >= prefix_ckpt_min) {
+                pin_new = common_prompt_checkpoint::PIN_PREFIX;
+            } else if (prefix_ckpt_boundaries > 0 && spans.is_user_start((int32_t) n_tokens_new)) {
+                pin_new = common_prompt_checkpoint::PIN_BOUNDARY;
+            }
+        }
+
         // update_slots() erased checkpoints past the common prefix also, so one at the same position holds the same state - keep it
         // instead of copying again, unless it came from a slot file (id_task == -1, may fail to load)
         for (auto & ck : slot.prompt.checkpoints) {
@@ -2921,9 +2954,48 @@ private:
                 SLT_TRC(slot, "reusing context checkpoint at n_tokens = %" PRId64 "\n", cur.n_tokens);
                 // the checkpoint can be shared with another slot or the prompt cache: claim it for this slot's task
                 slot.ckpt_claims.emplace_back(ck, id_task);
+                // p7: the same tokens, so the same message boundary
+                if (pin_new > cur.pin) {
+                    if (pin_new == common_prompt_checkpoint::PIN_PREFIX) {
+                        prefix_ckpt_metrics.n_pinned++;
+                    }
+                    cur.pin = pin_new;
+                }
                 return;
             }
         }
+
+        // p7: the checkpoints the limit below evicts last - pinned prefix checkpoints, and up to
+        // LLAMA_PREFIX_CKPT_BOUNDARIES user-boundary checkpoints spread over the history: oldest first, each at least
+        // (n_tokens - prefix) / (N + 1) tokens past the previous one. At most n_ctx_checkpoints - 2 are protected,
+        // so the list keeps room for the checkpoints near the prompt end
+        std::unordered_set<const common_prompt_checkpoint *> ckpt_protected;
+        if (prefix_ckpt_enabled) {
+            const size_t n_max = params_base.n_ctx_checkpoints > 2 ? (size_t) params_base.n_ctx_checkpoints - 2 : 0;
+            int64_t n_last = 0;
+            for (const auto & ck : slot.prompt.checkpoints) {
+                if (ck->pin == common_prompt_checkpoint::PIN_PREFIX && ckpt_protected.size() < n_max) {
+                    ckpt_protected.insert(ck.get());
+                    n_last = std::max(n_last, ck->n_tokens);
+                }
+            }
+            if (prefix_ckpt_boundaries > 0) {
+                const int64_t n_cur = slot.prompt.n_tokens() - n_tokens_cur;
+                const int64_t gap   = std::max<int64_t>(1, (n_cur - n_last) / (prefix_ckpt_boundaries + 1));
+                int n_boundary = 0;
+                for (const auto & ck : slot.prompt.checkpoints) {
+                    if (ck->pin == common_prompt_checkpoint::PIN_BOUNDARY && ck->n_tokens >= n_last + gap &&
+                            n_boundary < prefix_ckpt_boundaries && ckpt_protected.size() < n_max) {
+                        ckpt_protected.insert(ck.get());
+                        n_last = ck->n_tokens;
+                        n_boundary++;
+                    }
+                }
+            }
+        }
+        const auto is_protected = [&](const std::shared_ptr<const common_prompt_checkpoint> & ck) {
+            return ckpt_protected.count(ck.get()) > 0;
+        };
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -2933,7 +3005,7 @@ private:
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             const auto & cur = **it;
-            if (cur.id_task != id_task && !slot.ckpt_claimed(*it) && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
+            if (cur.id_task != id_task && !slot.ckpt_claimed(*it) && !is_protected(*it) && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
@@ -2946,13 +3018,18 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = *slot.prompt.checkpoints.front();
+            // make room for the new checkpoint, if needed - the oldest one that is not protected (p7)
+            auto it_old = std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                    [&](const auto & ck) { return !is_protected(ck); });
+            if (it_old == slot.prompt.checkpoints.end()) {
+                it_old = slot.prompt.checkpoints.begin();
+            }
+            const auto & cur = **it_old;
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(it_old);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2972,6 +3049,11 @@ private:
         auto & cur = *ckpt;
 
         cur.id_task = id_task;
+        cur.pin     = pin_new;
+        if (pin_new == common_prompt_checkpoint::PIN_PREFIX) {
+            prefix_ckpt_metrics.n_pinned++;
+            SLT_INF(slot, "pinned prefix checkpoint at n_tokens = %" PRId64 "\n", slot.prompt.n_tokens() - n_tokens_cur);
+        }
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -4526,6 +4608,13 @@ private:
                                         pos_next = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) cur.n_tokens);
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past, (float) cur.size() / 1024 / 1024);
+                                        if (prefix_ckpt_enabled && cur.pin == common_prompt_checkpoint::PIN_PREFIX) {
+                                            SLT_INF(slot, "restored pinned prefix checkpoint, n_tokens = %d of %d, lcp = %d\n", n_past, slot.task->n_tokens(), n_prefix);
+                                            prefix_ckpt_metrics.n_restores++;
+                                            prefix_ckpt_metrics.n_tokens += n_past;
+                                        } else if (prefix_ckpt_enabled && cur.pin == common_prompt_checkpoint::PIN_BOUNDARY) {
+                                            prefix_ckpt_metrics.n_boundary_restores++;
+                                        }
                                     }
 
                                     if (do_reset) {
@@ -4697,6 +4786,10 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // p7: always checkpoint the start of the first user message (the end of the system+tools prefix)
+                    const auto prefix_pos = prefix_ckpt_enabled ? spans.first_user_message_pos() : -1;
+                    const bool prefix_pin = prefix_pos >= prefix_ckpt_min;
+
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
@@ -4743,7 +4836,7 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_user_pos || (prefix_pin && pos == prefix_pos) || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -4782,6 +4875,7 @@ private:
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_prefix_end        = prefix_pin && n_tokens_start == prefix_pos;
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -4819,7 +4913,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || is_prefix_end || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
