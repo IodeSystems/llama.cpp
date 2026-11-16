@@ -103,10 +103,36 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         }
 
         // prepare the recurrent batches first
-        if (!mem_recr->prepare(ubatches)) {
+        bool rs_hazard = false;
+        if (!mem_recr->prepare(ubatches, mem_recr->n_rs_seq > 0 ? &rs_hazard : nullptr)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        }
+
+        if (rs_hazard) {
+            // a later ubatch would overwrite the rollback snapshots of a seq from an earlier one (it moves that
+            // seq's recurrent cell): split by sequence instead, a ubatch of one seq never moves another seq's cell
+            LLAMA_LOG_DEBUG("%s: rollback snapshots would be overwritten, splitting by sequence\n", __func__);
+
+            balloc.split_reset();
+            ubatches.clear();
+            while (true) {
+                llama_ubatch ubatch = balloc.split_seq(n_ubatch);
+                if (ubatch.n_tokens == 0) {
+                    break;
+                }
+                ubatches.push_back(std::move(ubatch)); // NOLINT
+            }
+
+            if (balloc.get_n_used() < balloc.get_n_tokens()) {
+                break;
+            }
+
+            if (!mem_recr->prepare(ubatches)) {
+                LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
+                return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+            }
         }
 
         // prepare the attention cache
