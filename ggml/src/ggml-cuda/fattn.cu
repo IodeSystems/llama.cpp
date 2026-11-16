@@ -504,11 +504,21 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         }                                                                                                                          \
     }                                                                                                                              \
 
+// The DKQ=DV=512 vec kernels have no instance files and are compiled in this file, for every type pair: only with
+// GGML_CUDA_FATTN_MMA_FUSED_ALL (build cost, see fattn-mma-f16.cuh).
+#ifdef GGML_CUDA_FATTN_MMA_FUSED_ALL
+#define FATTN_VEC_CASE_512(type_K_case, type_V_case) FATTN_VEC_CASE(512, type_K_case, type_V_case)
+#define FATTN_VEC_MAX_D 512
+#else
+#define FATTN_VEC_CASE_512(type_K_case, type_V_case)
+#define FATTN_VEC_MAX_D 256
+#endif // GGML_CUDA_FATTN_MMA_FUSED_ALL
+
 #define FATTN_VEC_CASES_ALL_D(type_K_case, type_V_case) \
     FATTN_VEC_CASE( 64, type_K_case, type_V_case)       \
     FATTN_VEC_CASE(128, type_K_case, type_V_case)       \
     FATTN_VEC_CASE(256, type_K_case, type_V_case)       \
-    FATTN_VEC_CASE(512, type_K_case, type_V_case)       \
+    FATTN_VEC_CASE_512(type_K_case, type_V_case)        \
 
 typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
@@ -748,7 +758,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool can_use_vector_kernel = Q->ne[0] <= FATTN_VEC_MAX_D && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // The MMA kernel and the vector kernel can read K/V through the kv_rows gather list:
     if (kv_rows) {
@@ -891,7 +901,7 @@ static bool ggml_cuda_fattn_mma_f16_fused_q_applies(const int cc, const ggml_ten
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    if ((Q->ne[0] != 128 && Q->ne[0] != 256 && Q->ne[0] != 512) || V->ne[0] != Q->ne[0]) {
+    if (!ggml_cuda_fattn_mma_fused_dkq_compiled(Q->ne[0]) || V->ne[0] != Q->ne[0]) {
         return false;
     }
 
