@@ -525,6 +525,15 @@ struct server_prompt_cache_metrics {
     uint64_t n_entries = 0;
     uint64_t n_bytes   = 0; // real allocated bytes
 
+    // host pool (LLAMA_HOST_POOL_RESERVE): compaction of the cache arena and free space per arena
+    uint64_t n_compactions         = 0;
+    uint64_t n_compactions_skipped = 0;
+    uint64_t bytes_compacted       = 0;
+    double   compaction_s          = 0.0;
+    int      n_arenas              = 0; // 0 = cache, 1 = slot
+    uint64_t arena_free   [2]      = {};
+    uint64_t arena_largest[2]      = {};
+
     uint64_t n_hits    = 0; // load() restored a cached entry into the slot
     uint64_t n_misses  = 0; // load() found no usable entry (or the restore failed)
     uint64_t n_matched = 0; // load() found an entry but the slot's own prompt was better (counted in n_misses too)
