@@ -26,9 +26,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <condition_variable>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <filesystem>
 #include <random>
 #include <utility>
@@ -136,6 +139,89 @@ static std::vector<llama_token> server_sample_and_accept_synth(
 
     return result;
 }
+
+// corrallm p8: a small persistent pool for per-slot target sampling (LLAMA_PAR_SAMPLING=1)
+// run() executes fn(0..n_tasks-1) on the calling thread and up to n_threads-1 workers, and returns when all are done.
+// fn must not throw.
+struct server_par_pool {
+    explicit server_par_pool(int n_workers) {
+        for (int i = 0; i < n_workers; ++i) {
+            workers.emplace_back([this, i]() { worker_loop(i); });
+        }
+    }
+
+    ~server_par_pool() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stop = true;
+        }
+        cv_work.notify_all();
+        for (auto & w : workers) {
+            w.join();
+        }
+    }
+
+    void run(size_t n, int n_threads, const std::function<void(size_t)> & f) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            fn       = &f;
+            n_tasks  = n;
+            next     = 0;
+            n_wake   = std::max(0, std::min<int>(std::min<int>(n_threads, (int) n) - 1, (int) workers.size()));
+            n_active = n_wake;
+            gen++;
+        }
+        cv_work.notify_all();
+
+        drain();
+
+        std::unique_lock<std::mutex> lock(mtx);
+        cv_done.wait(lock, [this]() { return n_active == 0; });
+        fn = nullptr;
+    }
+
+private:
+    void drain() {
+        for (size_t k = next.fetch_add(1); k < n_tasks; k = next.fetch_add(1)) {
+            (*fn)(k);
+        }
+    }
+
+    void worker_loop(int idx) {
+        uint64_t seen = 0;
+        std::unique_lock<std::mutex> lock(mtx);
+        while (true) {
+            cv_work.wait(lock, [&]() { return stop || gen != seen; });
+            if (stop) {
+                return;
+            }
+            seen = gen;
+            if (idx >= n_wake) {
+                continue;
+            }
+            lock.unlock();
+            drain();
+            lock.lock();
+            if (--n_active == 0) {
+                cv_done.notify_one();
+            }
+        }
+    }
+
+    std::vector<std::thread> workers;
+    std::mutex               mtx;
+    std::condition_variable  cv_work;
+    std::condition_variable  cv_done;
+
+    const std::function<void(size_t)> * fn = nullptr;
+
+    size_t              n_tasks  = 0;
+    std::atomic<size_t> next     {0};
+    int                 n_wake   = 0;
+    int                 n_active = 0;
+    uint64_t            gen      = 0;
+    bool                stop     = false;
+};
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -1090,6 +1176,8 @@ public:
         if (prompt_cache) {
             res.prefix_ckpt.n_cache_copies = prompt_cache->n_prefix_copies;
         }
+        res.par_sampling = par_sampling_metrics;
+        res.par_sampling.enabled = par_sampling_metered;
         return res;
     }
 
@@ -1868,6 +1956,20 @@ private:
     const int     prefix_ckpt_boundaries = getenv("LLAMA_PREFIX_CKPT_BOUNDARIES") ? std::max(0, atoi(getenv("LLAMA_PREFIX_CKPT_BOUNDARIES"))) : 0;
 
     server_prefix_ckpt_metrics prefix_ckpt_metrics;
+
+    // corrallm p8: parallel per-slot target sampling, LLAMA_PAR_SAMPLING=1 enables (default off). After the target
+    // decode, each slot's sample/accept (and speculative verification) runs as one task on a small persistent pool;
+    // everything that touches shared server state (results, KV ops, metrics, the speculative state) stays on this
+    // thread, after the join, in slot order. Only used when >= 2 slots sample in the same step.
+    // LLAMA_PAR_SAMPLING_THREADS: most threads for one step, including this one (default 4).
+    // The par_sampling_* metrics are emitted when LLAMA_PAR_SAMPLING is set at all, so =0 measures the serial cost.
+    const bool par_sampling_enabled  = getenv("LLAMA_PAR_SAMPLING") && atoi(getenv("LLAMA_PAR_SAMPLING")) != 0;
+    const bool par_sampling_metered  = getenv("LLAMA_PAR_SAMPLING") != nullptr;
+    const int  par_sampling_threads  = getenv("LLAMA_PAR_SAMPLING_THREADS") ? std::max(1, std::min(64, atoi(getenv("LLAMA_PAR_SAMPLING_THREADS")))) : 4;
+
+    std::unique_ptr<server_par_pool> par_pool;
+
+    server_par_sampling_metrics par_sampling_metrics;
 
     // tokens of `tokens` that the memory behind prompt `p` can resume from: the common prefix for attention-only
     // memory; with recurrent state, the whole prefix only if it covers the full state, else the latest checkpoint
@@ -5151,70 +5253,121 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
-        iterate(slots, [&](server_slot & slot) {
-            // optionally send prompt processing progress
-            if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
-                if (slot.task->params.stream && slot.task->params.return_progress) {
-                    send_partial_response(slot, {}, true);
+        // corrallm p8: one sampling job per slot and step. run_job() touches only the slot's own sampler, RNGs and
+        // draft, plus read-only logits of the target context, so jobs of different slots may run concurrently
+        // (LLAMA_PAR_SAMPLING=1). finish_*() send results and change KV, speculative and server state - this thread only.
+        struct par_job {
+            server_slot * slot    = nullptr;
+            bool          spec    = false;
+            int32_t       tok_idx = -1;               // non-speculative: batch index in the current sub-batch
+            llama_token   id      = LLAMA_TOKEN_NULL; // non-speculative: sampled token
+
+            size_t                   n_draft = 0;     // speculative: draft size before verification
+            std::vector<int32_t>     spec_i_batch;    // speculative: batch indices of the draft tokens
+            common_sampler_ptr       smpl_save;       // speculative: sampler before verification
+            std::vector<llama_token> accepted;        // speculative: accepted tokens + the target's next token
+
+            int64_t            t_us = 0;
+            std::exception_ptr err;
+        };
+
+        std::vector<par_job> jobs;
+        jobs.reserve(2*slots.size());
+
+        auto run_job = [&](par_job & job) {
+            const int64_t t_start = ggml_time_us();
+
+            server_slot & slot = *job.slot;
+
+            try {
+                if (!job.spec) {
+                    job.id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, job.tok_idx);
+                    common_sampler_accept(slot.smpl.get(), job.id, true);
+                } else {
+                    // verify and try to accept the draft
+                    job.smpl_save.reset(common_sampler_clone(slot.smpl.get()));
+
+                    GGML_ASSERT(job.spec_i_batch.size() == job.n_draft + 1);
+                    GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
+                    const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+
+                    // drafters that fill no distribution fall back here
+                    const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+
+                    if (!synth_probs.empty()) {
+                        // synthetic acceptance replaces verification entirely, so it comes first
+                        job.accepted = server_sample_and_accept_synth(
+                                slot.smpl.get(), slot.ctx_tgt, job.spec_i_batch, slot.spec_draft,
+                                synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                    } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
+                        job.accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, job.spec_i_batch, slot.spec_draft);
+                    } else if (use_rejection) {
+                        job.accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, job.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                    } else {
+                        job.accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, job.spec_i_batch, slot.spec_draft);
+                    }
+                }
+            } catch (...) {
+                job.err = std::current_exception();
+            }
+
+            job.t_us = ggml_time_us() - t_start;
+        };
+
+        auto meter_serial = [&](const par_job & job) {
+            if (par_sampling_metered) {
+                par_sampling_metrics.t_wall_us += job.t_us;
+                par_sampling_metrics.t_work_us += job.t_us;
+            }
+        };
+
+        auto run_jobs_parallel = [&]() {
+            scoped_timer timer(t_sampl, n_sampl);
+
+            const int64_t t_start = ggml_time_us();
+
+            const bool on_pool = jobs.size() >= 2 && par_sampling_threads >= 2;
+            if (on_pool) {
+                // the first sync after a decode accounts the eval and reorders the outputs - both write the context,
+                // so do them here; the getters the jobs then call only read it
+                for (const auto & job : jobs) {
+                    llama_synchronize(job.slot->ctx_tgt);
+                    llama_get_logits(job.slot->ctx_tgt);
+                }
+
+                if (!par_pool) {
+                    par_pool = std::make_unique<server_par_pool>(par_sampling_threads - 1);
+                }
+
+                const std::function<void(size_t)> fn = [&](size_t i) { run_job(jobs[i]); };
+                par_pool->run(jobs.size(), par_sampling_threads, fn);
+            } else {
+                for (auto & job : jobs) {
+                    run_job(job);
                 }
             }
 
-            if (!is_inside_view(slot.i_batch)) {
-                // the required token not in this sub-batch, skip
-                return;
+            par_sampling_metrics.t_wall_us += ggml_time_us() - t_start;
+            for (const auto & job : jobs) {
+                par_sampling_metrics.t_work_us += job.t_us;
+            }
+            if (on_pool) {
+                par_sampling_metrics.n_steps += 1;
+                par_sampling_metrics.n_jobs  += jobs.size();
+            }
+        };
+
+        auto finish_single = [&](par_job & job) {
+            server_slot & slot = *job.slot;
+
+            if (job.err) {
+                std::rethrow_exception(job.err);
             }
 
-            if (slot.state == SLOT_STATE_DONE_PROMPT) {
-                if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
-                    // prompt evaluated for embedding
-                    send_embedding(slot, batch.view);
-                    slot.release();
-                    slot.i_batch = -1;
-                    return;
-                }
-
-                if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
-                    send_rerank(slot, batch.view);
-                    slot.release();
-                    slot.i_batch = -1;
-                    return;
-                }
-
-                if (slot.task->type == SERVER_TASK_TYPE_DECISION) {
-                    send_decision(slot, batch.view, slot.i_batch - off);
-                    slot.release();
-                    slot.i_batch = -1;
-                    return;
-                }
-
-                GGML_ASSERT(slot.task->need_sampling());
-
-                // prompt evaluated for next-token prediction
-                slot.state = SLOT_STATE_GENERATING;
-
-                if (slot.can_speculate()) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
-                }
-            } else if (slot.state != SLOT_STATE_GENERATING) {
-                return;
-            }
-
-            if (slot.can_speculate() && !slot.spec_draft.empty()) {
-                return; // sample using speculative decoding
-            }
-
-            // shifted according to the current sub-batch
-            const int tok_idx = slot.i_batch - off;
-
-            llama_token id;
-            {
-                scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
-            }
+            const int         tok_idx = job.tok_idx;
+            const llama_token id      = job.id;
 
             slot.i_batch = -1;
-
-            common_sampler_accept(slot.smpl.get(), id, true);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
@@ -5248,47 +5401,21 @@ private:
             }
 
             slot.print_timings_tg();
-        });
+        };
 
-        // speculative decoding - main model sample and accept
-        iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
-                    slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
-                return;
+        auto finish_spec = [&](par_job & job) {
+            server_slot & slot = *job.slot;
+
+            if (job.err) {
+                std::rethrow_exception(job.err);
             }
 
-            // save the original draft size
-            const size_t n_draft = slot.spec_draft.size();
+            const size_t n_draft = job.n_draft;
 
-            GGML_ASSERT(n_draft > 0);
+            const auto & spec_i_batch = job.spec_i_batch;
 
-            // batch indices of the draft tokens, used to get the token probabilities below
-            auto spec_i_batch = std::move(slot.spec_i_batch);
-
-            // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
-
-                GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
-                GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
-                const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-
-                // drafters that fill no distribution fall back here
-                const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
-
-                std::vector<llama_token> accepted;
-                if (!synth_probs.empty()) {
-                    // synthetic acceptance replaces verification entirely, so it comes first
-                    accepted = server_sample_and_accept_synth(
-                            slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
-                } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
-                    accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
-                } else if (use_rejection) {
-                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
-                } else {
-                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
-                }
+                std::vector<llama_token> accepted = std::move(job.accepted);
 
                 GGML_ASSERT(accepted.size() >= 1);
 
@@ -5323,7 +5450,7 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        common_sampler_copy(job.smpl_save.get(), slot.smpl.get());
 
                         return;
                     }
@@ -5395,7 +5522,131 @@ private:
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
+        };
+
+        iterate(slots, [&](server_slot & slot) {
+            // optionally send prompt processing progress
+            if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
+                if (slot.task->params.stream && slot.task->params.return_progress) {
+                    send_partial_response(slot, {}, true);
+                }
+            }
+
+            if (!is_inside_view(slot.i_batch)) {
+                // the required token not in this sub-batch, skip
+                return;
+            }
+
+            if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
+                    // prompt evaluated for embedding
+                    send_embedding(slot, batch.view);
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
+                if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
+                    send_rerank(slot, batch.view);
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
+                if (slot.task->type == SERVER_TASK_TYPE_DECISION) {
+                    send_decision(slot, batch.view, slot.i_batch - off);
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
+                GGML_ASSERT(slot.task->need_sampling());
+
+                // prompt evaluated for next-token prediction
+                slot.state = SLOT_STATE_GENERATING;
+
+                if (slot.can_speculate()) {
+                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                }
+            } else if (slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+
+            if (slot.can_speculate() && !slot.spec_draft.empty()) {
+                return; // sample using speculative decoding
+            }
+
+            // shifted according to the current sub-batch
+            const int tok_idx = slot.i_batch - off;
+
+            par_job & job = jobs.emplace_back();
+            job.slot    = &slot;
+            job.tok_idx = tok_idx;
+
+            if (par_sampling_enabled) {
+                return; // sampled with the other slots below
+            }
+
+            {
+                scoped_timer timer(t_sampl, n_sampl);
+                run_job(job);
+            }
+            meter_serial(job);
+            finish_single(job);
         });
+
+        // speculative decoding - main model sample and accept
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
+                    slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
+                return;
+            }
+
+            par_job & job = jobs.emplace_back();
+            job.slot = &slot;
+            job.spec = true;
+
+            // save the original draft size
+            job.n_draft = slot.spec_draft.size();
+
+            GGML_ASSERT(job.n_draft > 0);
+
+            // batch indices of the draft tokens, used to get the token probabilities below
+            job.spec_i_batch = std::move(slot.spec_i_batch);
+
+            if (par_sampling_enabled) {
+                return; // verified with the other slots below
+            }
+
+            run_job(job);
+            meter_serial(job);
+            finish_spec(job);
+        });
+
+        if (par_sampling_enabled && !jobs.empty()) {
+            run_jobs_parallel();
+
+            // results, KV ops and the speculative state: this thread, in slot order, as the serial loops above
+            for (bool spec_jobs : { false, true }) {
+                for (auto & job : jobs) {
+                    if (job.spec != spec_jobs) {
+                        continue;
+                    }
+                    server_slot & slot = *job.slot;
+                    try {
+                        if (spec_jobs) {
+                            finish_spec(job);
+                        } else {
+                            finish_single(job);
+                        }
+                    } catch (const std::exception & e) {
+                        SLT_ERR(slot, "got exception: %s\n", e.what());
+                        send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                        slot.release();
+                    }
+                }
+            }
+        }
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
