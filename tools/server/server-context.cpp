@@ -340,6 +340,19 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // checkpoints the current task reused instead of creating (create_checkpoint), held here and not in the
+    // checkpoint because the checkpoint can be shared with another slot (xslot) or the prompt cache
+    std::vector<std::pair<std::weak_ptr<const common_prompt_checkpoint>, int>> ckpt_claims;
+
+    bool ckpt_claimed(const std::shared_ptr<const common_prompt_checkpoint> & ck) const {
+        for (const auto & c : ckpt_claims) {
+            if (!c.first.owner_before(ck) && !ck.owner_before(c.first)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -1069,6 +1082,8 @@ public:
         if (prompt_cache) {
             res.cache = prompt_cache->get_metrics();
         }
+        res.xslot = xslot_metrics;
+        res.xslot.enabled = xslot_enabled;
         return res;
     }
 
@@ -1826,6 +1841,138 @@ private:
         return nullptr;
     }
 
+    // corrallm xslot (p6): cross-slot KV reuse, LLAMA_XSLOT=1 enables (default off), LLAMA_XSLOT_MIN sets the
+    // smallest prefix worth attaching (default 256 tokens)
+    const bool    xslot_enabled    = getenv("LLAMA_XSLOT") && atoi(getenv("LLAMA_XSLOT")) != 0;
+    const int64_t xslot_min_tokens = getenv("LLAMA_XSLOT_MIN") ? atoll(getenv("LLAMA_XSLOT_MIN")) : 256;
+
+    server_xslot_metrics xslot_metrics;
+
+    // tokens of `tokens` that the memory behind prompt `p` can resume from: the common prefix for attention-only
+    // memory; with recurrent state, the whole prefix only if it covers the full state, else the latest checkpoint
+    // that update_slots() would restore for this prefix
+    int64_t xslot_usable(const server_prompt & p, const server_tokens & tokens) const {
+        const int64_t lcp = p.tokens.get_common_prefix(tokens);
+        if (lcp == 0 || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART || lcp >= p.n_tokens()) {
+            return lcp;
+        }
+        const llama_pos pos_next = p.tokens.pos_next(lcp);
+        int64_t best = 0;
+        for (const auto & ck : p.checkpoints) {
+            if (ck->n_tokens <= lcp && ck->pos_max <= pos_next && ck->n_tokens > best) {
+                best = ck->n_tokens;
+            }
+        }
+        return best;
+    }
+
+    // start `dst` from another slot's live cells (busy or idle) when they cover more of the prompt than both
+    // `dst`'s own cells and the prompt cache entry the normal path would load. Attention cells are shared (seq_cp
+    // is metadata under --kv-unified), the recurrent cell is shared copy-on-write, the checkpoint list is shared
+    // by pointer; update_slots() then restores a checkpoint at or below the divergence as for a same-slot hit.
+    void xslot_try_attach(server_slot & dst, const server_task & task, bool & update_cache) {
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            return;
+        }
+
+        const int64_t n_own = xslot_usable(dst.prompt, task.tokens);
+
+        server_slot * src        = nullptr;
+        int64_t       n_src      = n_own;
+        int64_t       n_starting = 0;
+        for (server_slot & other : slots) {
+            if (&other == &dst || other.prompt.tokens.empty()) {
+                continue;
+            }
+            const int64_t n = xslot_usable(other.prompt, task.tokens);
+            // a slot not yet past SLOT_STATE_STARTED has not reconciled its tokens with its memory
+            if (other.state == SLOT_STATE_STARTED || other.state == SLOT_STATE_WAIT_OTHER) {
+                n_starting = std::max(n_starting, n);
+                continue;
+            }
+            if (n > n_src) {
+                n_src = n;
+                src   = &other;
+            }
+        }
+
+        const auto skip = [&](server_xslot_skip_reason reason, int64_t n) {
+            xslot_metrics.n_skipped[reason]++;
+            SLT_INF(dst, "xslot: skipped (%s), usable %" PRId64 " vs own %" PRId64 "\n", server_xslot_skip_reason_str(reason), n, n_own);
+        };
+
+        if (src == nullptr) {
+            if (n_starting > n_own && n_starting >= xslot_min_tokens) {
+                skip(SERVER_XSLOT_SKIP_SOURCE_STARTING, n_starting);
+            }
+            return;
+        }
+        if (n_src < xslot_min_tokens) {
+            skip(SERVER_XSLOT_SKIP_BELOW_MIN, n_src);
+            return;
+        }
+        // shared attention cells hold one position for all their sequences: anything that shifts or rewrites the
+        // cells of one sequence in place would corrupt the other
+        if (!params_base.kv_unified) {
+            skip(SERVER_XSLOT_SKIP_NOT_UNIFIED, n_src);
+            return;
+        }
+        if (n_swa > 0) {
+            skip(SERVER_XSLOT_SKIP_SWA, n_src);
+            return;
+        }
+        if (params_base.ctx_shift) {
+            skip(SERVER_XSLOT_SKIP_CTX_SHIFT, n_src);
+            return;
+        }
+        if (task.params.n_cache_reuse > 0 && llama_memory_can_shift(llama_get_memory(ctx_tgt)) && !dst.prompt.tokens.has_mtmd) {
+            skip(SERVER_XSLOT_SKIP_CACHE_REUSE, n_src);
+            return;
+        }
+        // the source's cells were computed with its adapters
+        if (!params_base.lora_adapters.empty() || !task.params.lora.empty()) {
+            skip(SERVER_XSLOT_SKIP_LORA, n_src);
+            return;
+        }
+        // the prompt cache entry the normal path would load: prefer it when it resumes further
+        if (prompt_cache) {
+            const server_prompt * hp = prompt_cache->peek(dst.prompt, task.tokens);
+            const int64_t n_host = hp ? xslot_usable(*hp, task.tokens) : 0;
+            if (n_host > n_src) {
+                // a similarity pick does not consult the cache, make it
+                if (n_host > n_own) {
+                    update_cache = true;
+                }
+                skip(SERVER_XSLOT_SKIP_HOST_CACHE, n_src);
+                return;
+            }
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        // keep what this slot held, as the LRU path would
+        if (prompt_cache && !dst.prompt.tokens.empty() && dst.prompt_save(*prompt_cache)) {
+            prompt_cache->update();
+        }
+        dst.mem.seq_rm(dst.id, -1, -1);
+        dst.mem.seq_cp(src->id, dst.id, -1, -1);
+        dst.prompt = src->prompt.clone();
+        dst.ckpt_claims.clear();
+        // MTP carry-over row of the source position (used only when no checkpoint is restored)
+        if (spec) {
+            std::vector<uint8_t> st;
+            if (common_speculative_get_state(spec.get(), src->id, st)) {
+                common_speculative_set_state(spec.get(), dst.id, st);
+            }
+        }
+        SLT_INF(dst, "xslot: attached to slot %d (%s, %d tokens, %zu checkpoints), usable %" PRId64 " vs own %" PRId64 ", %.2f ms\n",
+                src->id, src->is_processing() ? "busy" : "idle", src->prompt.n_tokens(), src->prompt.checkpoints.size(),
+                n_src, n_own, (ggml_time_us() - t_start) / 1000.0);
+        xslot_metrics.n_attach++;
+        xslot_metrics.n_tokens += n_src;
+        update_cache = false;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1907,6 +2054,11 @@ private:
 
                 update_cache = true;
             }
+        }
+
+        if (ret && xslot_enabled && !ret->is_processing() && task.params.cache_prompt && !task.is_stateless() &&
+                !task.is_parent() && !task.is_child()) {
+            xslot_try_attach(*ret, task, update_cache);
         }
 
         if (ret) {
@@ -2756,15 +2908,19 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // claims of earlier tasks or of freed checkpoints no longer matter
+        slot.ckpt_claims.erase(std::remove_if(slot.ckpt_claims.begin(), slot.ckpt_claims.end(), [&](const auto & c) {
+            return c.second != id_task || c.first.expired();
+        }), slot.ckpt_claims.end());
+
         // update_slots() erased checkpoints past the common prefix also, so one at the same position holds the same state - keep it
         // instead of copying again, unless it came from a slot file (id_task == -1, may fail to load)
         for (auto & ck : slot.prompt.checkpoints) {
             const auto & cur = *ck;
             if (cur.id_task != -1 && cur.n_tokens == slot.prompt.n_tokens() - n_tokens_cur && cur.pos_min == pos_min && cur.pos_max == pos_max) {
                 SLT_TRC(slot, "reusing context checkpoint at n_tokens = %" PRId64 "\n", cur.n_tokens);
-                // corrallm port onto #30137: checkpoints are held as shared_ptr<const> but
-                // created non-const (make_shared), so writing id_task is defined
-                const_cast<common_prompt_checkpoint &>(cur).id_task = id_task;
+                // the checkpoint can be shared with another slot or the prompt cache: claim it for this slot's task
+                slot.ckpt_claims.emplace_back(ck, id_task);
                 return;
             }
         }
@@ -2777,7 +2933,7 @@ private:
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             const auto & cur = **it;
-            if (cur.id_task != id_task && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
+            if (cur.id_task != id_task && !slot.ckpt_claimed(*it) && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
