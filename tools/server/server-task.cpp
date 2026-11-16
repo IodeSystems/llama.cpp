@@ -1736,6 +1736,18 @@ std::string server_task_result_metrics::to_metrics() {
         });
     }
 
+    // parallel per-slot target sampling (LLAMA_PAR_SAMPLING)
+    if (metrics.par_sampling.enabled) {
+        const auto & ps = metrics.par_sampling;
+
+        add_items("counter", {
+            { "par_sampling_steps_total",        "Decode steps whose per-slot target sampling ran in parallel", (double) ps.n_steps },
+            { "par_sampling_jobs_total",         "Slot sampling tasks run in parallel", (double) ps.n_jobs },
+            { "par_sampling_wall_seconds_total", "Wall time of per-slot target sampling and accept", ps.t_wall_us / 1.e6 },
+            { "par_sampling_work_seconds_total", "Summed per-slot target sampling time (serial cost); minus wall = time saved", ps.t_work_us / 1.e6 },
+        });
+    }
+
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
         prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
