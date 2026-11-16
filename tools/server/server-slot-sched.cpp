@@ -85,6 +85,60 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
+size_t server_prompt_cache::size_overflow() const {
+    size_t res = 0;
+
+    for (const auto & state : states) {
+        if (state.data.overflow) {
+            res += state.data.size();
+        }
+    }
+
+    return res;
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase_state(std::list<server_prompt_cache_state>::iterator it) {
+    for (const auto & ckpt : it->prompt.checkpoints) {
+        if (ckpt.use_count() > 1) {
+            common_prompt_checkpoint_set_owner(*ckpt, COMMON_HOST_POOL_SLOT);
+        }
+    }
+
+    return states.erase(it);
+}
+
+void server_prompt_cache::log_overflow(const char * what, size_t bytes) {
+    const int64_t t_now = ggml_time_us();
+    if (t_now - t_ovf_log < 10*1000*1000) {
+        return;
+    }
+
+    const auto st = common_host_pool_get_stats();
+
+    SRV_INF("prompt cache overflow (%s): %s %.1f MiB; since last log: %" PRIu64 " saves over budget, evicted %" PRIu64 " entries (%.1f MiB), "
+            "released %" PRIu64 " idle regions (%.1f MiB), %" PRIu64 " entries to heap (%.1f MiB); "
+            "arena fragmented %" PRIu64 " (last: request %.1f MiB, largest free %.1f MiB); "
+            "cache %.1f / %.1f MiB real (idle %.1f MiB), heap %.1f / %.1f MiB, %zu entries\n",
+            overflow_heap ? "heap" : "evict", what, bytes / (1024.0 * 1024.0),
+            n_ovf_saves, n_ovf_evicted, bytes_ovf_evicted / (1024.0 * 1024.0),
+            st.n_release_sync - n_ovf_rel_sync0, (st.bytes_release_sync - bytes_ovf_rel_sync0) / (1024.0 * 1024.0),
+            n_ovf_heap, bytes_ovf_heap / (1024.0 * 1024.0),
+            st.n_frag - n_ovf_frag0, st.frag_request / (1024.0 * 1024.0), st.frag_largest / (1024.0 * 1024.0),
+            (size() - size_overflow()) / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0),
+            st.idle[COMMON_HOST_POOL_CACHE] / (1024.0 * 1024.0),
+            size_overflow() / (1024.0 * 1024.0), limit_overflow / (1024.0 * 1024.0), states.size());
+
+    t_ovf_log           = t_now;
+    n_ovf_saves         = 0;
+    n_ovf_evicted       = 0;
+    bytes_ovf_evicted   = 0;
+    n_ovf_heap          = 0;
+    bytes_ovf_heap      = 0;
+    n_ovf_rel_sync0     = st.n_release_sync;
+    bytes_ovf_rel_sync0 = st.bytes_release_sync;
+    n_ovf_frag0         = st.n_frag;
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -96,18 +150,22 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    // calculate checkpoints size to see if it will fit with the prompt
+    // calculate checkpoints size to see if it will fit with the prompt (real allocated bytes)
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt->size();
+        checkpoints_size += ckpt->real_size();
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    const bool pool = common_host_pool_enabled();
+
+    // real bytes of the new entry (pooled state buffers are rounded up to a size class)
+    const size_t state_size_new = common_host_pool_size_class(state_size_tgt) + common_host_pool_size_class(state_size_dft) + checkpoints_size;
 
     // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
+    const size_t limit_entry = overflow_heap ? std::max(limit_size, limit_overflow) : limit_size;
+    if (limit_size > 0 && state_size_new > limit_entry) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+                state_size_new / (1024.0 * 1024.0), limit_entry / (1024.0 * 1024.0));
         return nullptr;
     }
 
@@ -118,33 +176,110 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
-            it = states.erase(it);
+            it = erase_state(it);
         } else {
             ++it;
         }
     }
 
-    if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
+    if (limit_size > 0 && !pool) {
+        // no host pool: make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            erase_state(states.begin());
         }
     }
+
+    // with the host pool, the cache budget (limit_size) is enforced on real bytes, in use + idle,
+    // by the pool: an allocation over budget first releases idle cache regions (oldest first),
+    // then throws common_host_pool_over_budget and we evict the oldest entry and retry
+    const auto evict_oldest = [&]() {
+        n_ovf_evicted++;
+        bytes_ovf_evicted += states.front().size();
+        SRV_TRC(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                states.front().size() / (1024.0 * 1024.0));
+        erase_state(states.begin());
+    };
+
+    // the entry's checkpoints are counted by the cache from now on
+    for (const auto & ckpt : prompt.checkpoints) {
+        common_prompt_checkpoint_set_owner(*ckpt, COMMON_HOST_POOL_CACHE);
+    }
+    const auto ckpts_to_slot = [&]() {
+        for (const auto & ckpt : prompt.checkpoints) {
+            common_prompt_checkpoint_set_owner(*ckpt, COMMON_HOST_POOL_SLOT);
+        }
+    };
 
     common_state_data state_data_tgt;
     common_state_data state_data_dft;
 
+    bool over     = false; // did not fit without releasing idle regions or evicting
+    bool overflow = false;
+
+    const uint64_t n_release_sync0 = pool ? common_host_pool_get_stats().n_release_sync : 0;
+
     // check if we can allocate enough memory for the new state
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        // the checkpoints alone may push the cache over budget
+        while (!common_host_pool_trim(COMMON_HOST_POOL_CACHE)) {
+            over = true;
+            if (states.empty()) {
+                throw common_host_pool_over_budget();
+            }
+            evict_oldest();
+        }
+
+        for (;;) {
+            try {
+                common_host_pool_scope scope(COMMON_HOST_POOL_CACHE);
+                state_data_tgt.resize(state_size_tgt);
+                state_data_dft.resize(state_size_dft);
+                break;
+            } catch (const common_host_pool_over_budget &) {
+                state_data_tgt = common_state_data();
+                state_data_dft = common_state_data();
+                over = true;
+            }
+
+            if (overflow_heap) {
+                try {
+                    common_host_pool_scope scope(COMMON_HOST_POOL_OVERFLOW);
+                    state_data_tgt.resize(state_size_tgt);
+                    state_data_dft.resize(state_size_dft);
+                    overflow = true;
+                    break;
+                } catch (const common_host_pool_over_budget &) {
+                    state_data_tgt = common_state_data();
+                    state_data_dft = common_state_data();
+                }
+            }
+
+            if (states.empty()) {
+                throw common_host_pool_over_budget();
+            }
+            evict_oldest();
+        }
+    } catch (const common_host_pool_over_budget &) {
+        ckpts_to_slot();
+
+        n_ovf_saves++;
+        SRV_WRN(" - prompt state size %.3f MiB does not fit the cache budget even when empty, skipping\n",
+                state_size_new / (1024.0 * 1024.0));
+        log_overflow("skipped", state_size_new);
+
+        return nullptr;
     } catch (const std::bad_alloc & e) {
+        ckpts_to_slot();
+
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
         limit_size = std::max<size_t>(1, 0.4*size());
+        if (pool) {
+            common_host_pool_set_budget(COMMON_HOST_POOL_CACHE, limit_size);
+        }
 
         SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
 
@@ -159,10 +294,24 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.checkpoints =*/ prompt.checkpoints,
         },
         /*.data   =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
+            /*.main     =*/ std::move(state_data_tgt),
+            /*.drft     =*/ std::move(state_data_dft),
+            /*.overflow =*/ overflow,
         },
     });
+
+    if (pool && common_host_pool_get_stats().n_release_sync != n_release_sync0) {
+        over = true; // idle regions were released to fit
+    }
+
+    if (over) {
+        n_ovf_saves++;
+        if (overflow) {
+            n_ovf_heap++;
+            bytes_ovf_heap += states.back().data.size();
+        }
+        log_overflow(overflow ? "saved to heap" : "saved", states.back().size());
+    }
 
     return &states.back();
 }
@@ -247,6 +396,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
+
+        // the checkpoints are held by the slot now
+        for (const auto & ckpt : prompt.checkpoints) {
+            common_prompt_checkpoint_set_owner(*ckpt, COMMON_HOST_POOL_SLOT);
+        }
     }
 
     return true;
@@ -254,10 +408,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
 void server_prompt_cache::update() {
     if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
+        // overflow entries are bounded by limit_overflow, everything else by limit_size
+        while (!states.empty() && (size() - size_overflow() > limit_size || size_overflow() > limit_overflow)) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            erase_state(states.begin());
         }
     }
 
@@ -272,7 +427,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            erase_state(states.begin());
         }
     }
 

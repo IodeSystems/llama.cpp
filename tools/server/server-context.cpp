@@ -363,7 +363,7 @@ struct server_slot {
         const size_t n_dft = ctx_dft ? llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
         if (n_tgt != cur_size_tgt || n_dft != cur_size_dft) {
             SLT_ERR(*this, "%s", "failed to save complete prompt state\n");
-            prompt_cache.states.pop_back();
+            prompt_cache.erase_state(std::prev(prompt_cache.states.end()));
             return false;
         }
 
@@ -1111,6 +1111,8 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    bool ckpt_allowance_set = false; // host pool slot allowance, see create_checkpoint()
+
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
@@ -1613,8 +1615,30 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            if (prompt_cache->limit_size > 0) {
+                prompt_cache->overflow_heap  = params_base.cache_overflow_heap && common_host_pool_enabled();
+                prompt_cache->limit_overflow = !prompt_cache->overflow_heap ? 0 :
+                    params_base.cache_overflow_max_mib < 0 ? prompt_cache->limit_size :
+                    1024ull*1024ull*params_base.cache_overflow_max_mib;
+            }
+            if (params_base.cache_overflow_heap && !prompt_cache->overflow_heap) {
+                SRV_WRN("%s", "--cache-overflow heap needs a finite --cache-ram and the host pool (LLAMA_HOST_POOL != 0), using evict\n");
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+        }
+
+        // host pool budgets: the cache gets exactly --cache-ram (real bytes, in use + idle); slot checkpoints
+        // get their own pinned allowance once the first checkpoint size is known (create_checkpoint)
+        if (common_host_pool_enabled()) {
+            const size_t cache_bytes = prompt_cache && prompt_cache->limit_size > 0 ? prompt_cache->limit_size :
+                                       prompt_cache ? SIZE_MAX : 0;
+            common_host_pool_configure(cache_bytes, prompt_cache ? prompt_cache->limit_overflow : 0);
+            SRV_INF("host pool: cache budget %s, overflow %s (max %.1f MiB)\n",
+                    cache_bytes == SIZE_MAX ? "unlimited (not pinned)" : string_format("%.1f MiB", cache_bytes/(1024.0*1024.0)).c_str(),
+                    prompt_cache && prompt_cache->overflow_heap ? "heap" : "evict",
+                    prompt_cache ? prompt_cache->limit_overflow/(1024.0*1024.0) : 0.0);
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -2714,6 +2738,17 @@ private:
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         slot.prompt.checkpoints.push_back(std::move(ckpt));
+
+        // slot-held checkpoints get their own pinned allowance, sized from the first checkpoint
+        if (!ckpt_allowance_set && common_host_pool_enabled()) {
+            ckpt_allowance_set = true;
+            // pooled bytes per checkpoint (the first one may be plain heap in reserve mode, so not real_size())
+            const size_t ckpt_bytes = common_host_pool_size_class(cur.data_tgt.size()) + common_host_pool_size_class(cur.data_dft.size());
+            const size_t allowance  = slots.size() * (size_t) params_base.n_ctx_checkpoints * ckpt_bytes;
+            SRV_INF("host pool: slot checkpoint allowance %.1f MiB (%zu slots x %d checkpoints x %.1f MiB)\n",
+                    allowance/(1024.0*1024.0), slots.size(), params_base.n_ctx_checkpoints, ckpt_bytes/(1024.0*1024.0));
+            common_host_pool_set_budget(COMMON_HOST_POOL_SLOT, allowance);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",

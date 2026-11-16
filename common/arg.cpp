@@ -1705,6 +1705,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-overflow"}, "{evict,heap}",
+        "what to do when a prompt cache save exceeds --cache-ram (real allocated bytes, incl. idle pooled memory):\n"
+        "evict - release idle pooled memory, then evict the oldest entries (default)\n"
+        "heap  - put the entry in plain (unpinned) heap memory, up to --cache-overflow-max",
+        [](common_params & params, const std::string & value) {
+            if (value == "evict") {
+                params.cache_overflow_heap = false;
+            } else if (value == "heap") {
+                params.cache_overflow_heap = true;
+            } else {
+                throw std::invalid_argument("invalid value for --cache-overflow: " + value);
+            }
+        }
+    ).set_env("LLAMA_ARG_CACHE_OVERFLOW").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-overflow-max"}, "N",
+        "max heap memory in MiB for --cache-overflow heap; the oldest entries are evicted beyond it (default: same as --cache-ram)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-overflow-max must be non-negative");
+            }
+            params.cache_overflow_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_OVERFLOW_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

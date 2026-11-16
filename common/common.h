@@ -19,7 +19,9 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <cstdint>
 #include <cstdio>
+#include <new>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -663,6 +665,8 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
+    bool    cache_overflow_heap = false; // --cache-overflow heap: entries beyond cache-ram go to plain heap instead of evicting
+    int32_t cache_overflow_max_mib = -1; // max heap overflow in MiB, -1 = same as cache-ram
 
     // llama-connect params
     bool        server_connect      = false;
@@ -1318,7 +1322,74 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// pooled host memory for large sequence-state buffers (checkpoints, prompt cache)
+//  - requests >= 1 MiB are rounded up to a size class and reused from a free list
+//  - every region has an owner with a budget on real bytes (in use + idle):
+//      slot     - default, slot-held checkpoints; pinned up to the slot allowance, plain heap above it
+//      cache    - prompt cache entries (and checkpoints they hold); over budget -> common_host_pool_over_budget
+//      overflow - --cache-overflow heap entries; plain heap, never pooled, over budget -> over_budget
+//  - regions are pinned (GPU device host buffer type) once configured, else plain heap
+//  - a background thread releases regions idle for LLAMA_HOST_POOL_IDLE_S seconds (default 60)
+//  - LLAMA_HOST_POOL_RESERVE=1: pin the cache budget once at configure time and the slot allowance once
+//    when it is set, and sub-allocate from these arenas (2 MiB granularity, best fit, coalescing);
+//    no pinning or unpinning after that, nothing idle; falls back to the above if pinning fails
+//  - LLAMA_HOST_POOL=0 disables the pool (plain operator new/delete, no budgets)
+// thread-safe; allocation throws std::bad_alloc on failure
+enum common_host_pool_owner {
+    COMMON_HOST_POOL_SLOT     = 0,
+    COMMON_HOST_POOL_CACHE    = 1,
+    COMMON_HOST_POOL_OVERFLOW = 2,
+    COMMON_HOST_POOL_N_OWNERS = 3,
+};
+
+struct common_host_pool_over_budget : std::bad_alloc {
+    const char * what() const noexcept override { return "host pool: over budget"; }
+};
+
+struct common_host_pool_stats {
+    size_t   used  [COMMON_HOST_POOL_N_OWNERS]; // real bytes in use (pooled + plain heap)
+    size_t   idle  [COMMON_HOST_POOL_N_OWNERS];
+    size_t   budget[COMMON_HOST_POOL_N_OWNERS]; // SIZE_MAX = unlimited
+    size_t   pinned;
+    uint64_t n_release_sync;     // idle regions released to fit a budget
+    size_t   bytes_release_sync;
+    size_t   reserved;           // LLAMA_HOST_POOL_RESERVE arena bytes
+    uint64_t n_frag;             // arena requests that failed although enough bytes were free
+    size_t   frag_request;       // last such request
+    size_t   frag_largest;       // largest free extent at that time
+};
+
+void * common_host_pool_alloc(size_t size);
+void   common_host_pool_free (void * ptr, size_t size);
+bool   common_host_pool_enabled();
+
+// enables pinning; budgets in bytes (cache: SIZE_MAX = unlimited, cache regions are then not pinned)
+void   common_host_pool_configure(size_t cache_bytes, size_t overflow_bytes);
+void   common_host_pool_set_budget(common_host_pool_owner owner, size_t bytes);
+
+// real bytes a new pooled allocation of `size` bytes takes (size if not pooled)
+size_t common_host_pool_size_class(size_t size);
+// real bytes of an allocation of `size` bytes at ptr (the region size if pooled)
+size_t common_host_pool_usable_size(const void * ptr, size_t size);
+// move an allocation's bytes to another owner's accounting (no-op for overflow allocations)
+void   common_host_pool_set_owner(const void * ptr, size_t size, common_host_pool_owner owner);
+// release idle regions of an owner, oldest first, until it fits its budget; false if it still does not
+bool   common_host_pool_trim(common_host_pool_owner owner);
+common_host_pool_stats common_host_pool_get_stats();
+
+// owner of allocations made on this thread; returns the previous one
+common_host_pool_owner common_host_pool_set_scope(common_host_pool_owner owner);
+
+struct common_host_pool_scope {
+    common_host_pool_owner prev;
+    explicit common_host_pool_scope(common_host_pool_owner owner) : prev(common_host_pool_set_scope(owner)) {}
+    ~common_host_pool_scope() { common_host_pool_set_scope(prev); }
+    common_host_pool_scope(const common_host_pool_scope &) = delete;
+    common_host_pool_scope & operator=(const common_host_pool_scope &) = delete;
+};
+
 // leave default-inserted elements uninitialized; callers must fill them before use
+// memory comes from the host pool
 template <typename T>
 struct common_no_init_allocator : std::allocator<T> {
     template <typename U> struct rebind { using other = common_no_init_allocator<U>; };
@@ -1326,11 +1397,17 @@ struct common_no_init_allocator : std::allocator<T> {
     common_no_init_allocator() = default;
     template <typename U> common_no_init_allocator(const common_no_init_allocator<U> &) {}
 
+    T * allocate(size_t n) { return static_cast<T *>(common_host_pool_alloc(n * sizeof(T))); }
+    void deallocate(T * p, size_t n) { common_host_pool_free(p, n * sizeof(T)); }
+
     template <typename U> void construct(U * p) { ::new ((void *) p) U; }
 };
 
 // sequence state data, filled by llama_state_seq_get_data_ext()
 using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
+
+// real allocated bytes of a state buffer
+size_t common_state_data_bytes(const common_state_data & data);
 
 struct common_prompt_checkpoint {
     int64_t n_tokens;
@@ -1349,6 +1426,7 @@ struct common_prompt_checkpoint {
     std::vector<uint8_t> data_spec;
 
     size_t size() const;
+    size_t real_size() const; // allocated bytes, see common_state_data_bytes()
 
     bool empty() const;
     void clear();
@@ -1382,3 +1460,6 @@ struct common_prompt_checkpoint {
     void clear_tgt();
     void clear_dft();
 };
+
+// move a checkpoint's state buffers to another host pool owner's accounting
+void common_prompt_checkpoint_set_owner(const common_prompt_checkpoint & ckpt, common_host_pool_owner owner);
