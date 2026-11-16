@@ -1468,6 +1468,12 @@ struct common_prompt_checkpoint {
     // (optional) id of the task that created the checkpoint
     int id_task = -1;
 
+    // corrallm p7 (LLAMA_PREFIX_CKPT=1): eviction metadata, not checkpoint state - a checkpoint at the start
+    // of the first user message (the end of the shared system+tools prefix) or at an earlier user-message
+    // boundary, which the n_ctx_checkpoints limit evicts last. mutable: checkpoints are shared as const
+    enum pin_type : uint8_t { PIN_NONE = 0, PIN_BOUNDARY = 1, PIN_PREFIX = 2 };
+    mutable uint8_t pin = PIN_NONE;
+
     llama_pos pos_min;
     llama_pos pos_max;
 
