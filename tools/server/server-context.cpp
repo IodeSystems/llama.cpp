@@ -2728,6 +2728,19 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // update_slots() erased checkpoints past the common prefix also, so one at the same position holds the same state - keep it
+        // instead of copying again, unless it came from a slot file (id_task == -1, may fail to load)
+        for (auto & ck : slot.prompt.checkpoints) {
+            const auto & cur = *ck;
+            if (cur.id_task != -1 && cur.n_tokens == slot.prompt.n_tokens() - n_tokens_cur && cur.pos_min == pos_min && cur.pos_max == pos_max) {
+                SLT_TRC(slot, "reusing context checkpoint at n_tokens = %" PRId64 "\n", cur.n_tokens);
+                // corrallm port onto #30137: checkpoints are held as shared_ptr<const> but
+                // created non-const (make_shared), so writing id_task is defined
+                const_cast<common_prompt_checkpoint &>(cur).id_task = id_task;
+                return;
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -4055,6 +4068,10 @@ private:
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
 
+                        // number of cached tokens shared with the new prompt, before cache reuse shifts any chunk
+                        // or a checkpoint is restored
+                        int n_prefix = 0;
+
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
@@ -4139,6 +4156,8 @@ private:
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                 }
 
+                                n_prefix = n_past;
+
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
                                 const bool can_cache_reuse =
@@ -4204,9 +4223,6 @@ private:
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
-
-                            // number of cached tokens shared with the new prompt, before any checkpoint is restored
-                            const int n_prefix = n_past;
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
@@ -4279,6 +4295,10 @@ private:
                                             SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
                                             if (cur.pos_max > pos_next) {
+                                                return false;
+                                            }
+                                            // cache reuse shifted chunks over the tokens this checkpoint covers
+                                            if (n_past > n_prefix && cur.n_tokens > n_prefix) {
                                                 return false;
                                             }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
