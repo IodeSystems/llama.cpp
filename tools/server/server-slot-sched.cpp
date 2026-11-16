@@ -10,7 +10,7 @@
 // server_prompt
 //
 
-server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, bool has_new_tokens, int32_t n_swa, llama_pos pos_min) const {
+server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, int32_t n_unshifted, bool has_new_tokens, int32_t n_swa, llama_pos pos_min) const {
     server_prompt_reuse res;
     res.n_past   = n_prefix;
     res.pos_next = tokens.pos_next(n_prefix);
@@ -36,6 +36,10 @@ server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, bool has_new_toke
             SRV_TRC("checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
             if (cur.pos_max > res.pos_next) {
+                return false;
+            }
+            // cache reuse shifted chunks over the tokens this checkpoint covers
+            if (n_prefix > n_unshifted && cur.n_tokens > n_unshifted) {
                 return false;
             }
             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
