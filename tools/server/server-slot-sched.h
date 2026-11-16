@@ -106,6 +106,13 @@ struct server_prompt_cache {
     // counters for /metrics (gauges are filled by get_metrics())
     server_prompt_cache_metrics metrics;
 
+    // corrallm p7 (LLAMA_PREFIX_CKPT=1): checkpoint-aware selection in load(), see there. ckpt_limited: the
+    // memory resumes a shorter prefix only from a checkpoint (hybrid/recurrent), set by server_context
+    bool     prefix_ckpt     = false;
+    bool     ckpt_limited    = false;
+    int64_t  prefix_ckpt_min = 256; // smallest pinned prefix worth copying an entry for (tokens)
+    uint64_t n_prefix_copies = 0;   // entries copied into a slot for their pinned prefix checkpoint
+
     // --cache-overflow heap: entries beyond limit_size go to plain heap, up to limit_overflow bytes
     bool   overflow_heap  = false;
     size_t limit_overflow = 0;
@@ -150,6 +157,13 @@ struct server_prompt_cache {
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // p7: tokens of `tokens_new` that prompt `p` (common prefix `lcp`) can resume from (see xslot_usable)
+    int64_t usable(const server_prompt & p, int lcp) const;
+
+    // p7: when no entry beats the slot's own prompt, the entry whose pinned prefix checkpoint resumes further
+    // than `n_base` tokens (states.end() = none); load() copies it, the entry stays in the cache
+    std::list<server_prompt_cache_state>::const_iterator find_prefix_copy(const server_tokens & tokens_new, int64_t n_base, int64_t & n_usable) const;
 
     // the entry load() would restore for a slot holding `prompt`, without restoring it (nullptr = none)
     const server_prompt * peek(const server_prompt & prompt, const server_tokens & tokens_new) const;

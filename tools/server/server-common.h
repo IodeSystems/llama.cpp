@@ -608,6 +608,16 @@ struct server_xslot_metrics {
     uint64_t n_skipped[SERVER_XSLOT_SKIP_N_REASONS] = {};
 };
 
+// pinned prefix checkpoints (corrallm p7, LLAMA_PREFIX_CKPT=1)
+struct server_prefix_ckpt_metrics {
+    bool     enabled            = false;
+    uint64_t n_pinned           = 0; // checkpoints pinned at the start of the first user message
+    uint64_t n_restores         = 0; // prompts resumed from a pinned prefix checkpoint
+    uint64_t n_tokens           = 0; // tokens of those prompts not processed again
+    uint64_t n_boundary_restores = 0; // prompts resumed from a pinned user-boundary checkpoint (LLAMA_PREFIX_CKPT_BOUNDARIES)
+    uint64_t n_cache_copies     = 0; // prompt cache entries copied (not moved) into a slot for their pinned prefix
+};
+
 struct server_metrics {
     int64_t t_start = 0;
 
@@ -655,6 +665,9 @@ struct server_metrics {
 
     // cross-slot KV reuse counters, filled by server_context when the metrics are read
     server_xslot_metrics xslot;
+
+    // pinned prefix checkpoint counters, filled by server_context when the metrics are read
+    server_prefix_ckpt_metrics prefix_ckpt;
 
     void init() {
         t_start = ggml_time_us();

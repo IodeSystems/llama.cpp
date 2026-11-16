@@ -494,12 +494,55 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+int64_t server_prompt_cache::usable(const server_prompt & p, int lcp) const {
+    if (lcp <= 0 || !ckpt_limited || lcp >= p.n_tokens()) {
+        return lcp;
+    }
+    // the newest checkpoint update_slots() would restore for this prefix
+    const llama_pos pos_next = p.tokens.pos_next(lcp);
+    int64_t best = 0;
+    for (const auto & ck : p.checkpoints) {
+        if (ck->n_tokens <= lcp && ck->pos_max <= pos_next && ck->n_tokens > best) {
+            best = ck->n_tokens;
+        }
+    }
+    return best;
+}
+
+std::list<server_prompt_cache_state>::const_iterator server_prompt_cache::find_prefix_copy(const server_tokens & tokens_new, int64_t n_base, int64_t & n_usable) const {
+    auto res = states.cend();
+    n_usable = 0;
+    if (!prefix_ckpt || !ckpt_limited) {
+        return res;
+    }
+    for (auto it = states.cbegin(); it != states.cend(); ++it) {
+        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        if (lcp_cur >= it->prompt.n_tokens()) {
+            continue; // the whole entry is a prefix: the f_keep/f_sim selection handles it
+        }
+        const llama_pos pos_next = it->prompt.tokens.pos_next(lcp_cur);
+        for (const auto & ck : it->prompt.checkpoints) {
+            if (ck->pin != common_prompt_checkpoint::PIN_PREFIX || ck->n_tokens > lcp_cur || ck->pos_max > pos_next) {
+                continue;
+            }
+            if (ck->n_tokens >= prefix_ckpt_min && ck->n_tokens > n_base && ck->n_tokens > n_usable) {
+                n_usable = ck->n_tokens;
+                res = it;
+            }
+        }
+    }
+    return res;
+}
+
 const server_prompt * server_prompt_cache::peek(const server_prompt & prompt, const server_tokens & tokens_new) const {
     // same selection as load()
     const int lcp_base = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_base) / prompt.tokens.size() : -1.0f;
     float f_sim_best  = float(lcp_base) / tokens_new.size();
+
+    // p7: an entry that resumes fewer tokens than the slot's own prompt is not better
+    const int64_t n_base = prefix_ckpt ? usable(prompt, lcp_base) : 0;
 
     const server_prompt * res = nullptr;
     for (const auto & state : states) {
@@ -511,10 +554,20 @@ const server_prompt * server_prompt_cache::peek(const server_prompt & prompt, co
         if (f_keep_cur < 0.25f) {
             continue;
         }
+        if (prefix_ckpt && usable(state.prompt, lcp_cur) < n_base) {
+            continue;
+        }
         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
             res = &state.prompt;
+        }
+    }
+    if (res == nullptr) {
+        int64_t n_copy = 0;
+        const auto it = find_prefix_copy(tokens_new, n_base, n_copy);
+        if (it != states.cend()) {
+            res = &it->prompt;
         }
     }
     return res;
@@ -527,6 +580,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     float f_sim_best  = float(lcp_best) / tokens_new.size();
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+
+    // p7: an entry that resumes fewer tokens than the slot's own prompt is not better
+    const int64_t n_base = prefix_ckpt ? usable(prompt, lcp_best) : 0;
 
     auto it_best = states.end();
 
@@ -553,12 +609,67 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             it_match    = it;
         }
 
+        if (prefix_ckpt && usable(it->prompt, lcp_cur) < n_base) {
+            SRV_TRC("   - skipped, resumes fewer tokens than the slot's own prompt (%" PRId64 ")\n", n_base);
+            continue;
+        }
+
         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
             lcp_best    = lcp_cur;
 
             it_best = it;
+        }
+    }
+
+    // p7: no entry beats the slot's own prompt, but an entry's pinned prefix checkpoint resumes further. It is
+    // copied, not moved: the entry is usually a long conversation (f_keep < 0.25) that must stay cached, and
+    // update_slots() then cuts the slot's copy back to the checkpoint. The slot shares the entry's checkpoints,
+    // which stay counted by the cache while the entry holds them
+    if (it_best == states.end()) {
+        int64_t n_copy = 0;
+        const auto it_c = find_prefix_copy(tokens_new, n_base, n_copy);
+        if (it_c != states.cend()) {
+            auto it = states.erase(it_c, it_c); // non-const iterator to the same entry
+
+            SRV_INF(" - copying prompt with length %d for its pinned prefix checkpoint (%" PRId64 " tokens, own prompt %" PRId64 ")\n",
+                    it->prompt.n_tokens(), n_copy, n_base);
+
+            bool ok = true;
+            {
+                const auto & data = it->data.main;
+                const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), data.size(), id_slot, 0);
+                if (n != data.size()) {
+                    SRV_ERR("failed to restore state with size %zu\n", data.size());
+                    ok = false;
+                }
+            }
+            if (ok && !it->data.drft.empty()) {
+                GGML_ASSERT(ctx_dft);
+                const auto & data = it->data.drft;
+                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), data.size(), id_slot, 0);
+                if (n != data.size()) {
+                    SRV_WRN("failed to restore state with size %zu\n", data.size());
+                    ok = false;
+                }
+            }
+            if (!ok) {
+                metrics.n_misses++;
+                return false; // the caller clears the slot
+            }
+
+            prompt = it->prompt.clone();
+            // a different conversation from here on: do not carry the entry's history over
+            prompt.t_created = 0;
+            prompt.n_hits    = 0;
+
+            it->t_last_used = ggml_time_us();
+
+            metrics.n_hits++;
+            n_prefix_copies++;
+
+            return true;
         }
     }
 

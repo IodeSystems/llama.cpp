@@ -1723,6 +1723,19 @@ std::string server_task_result_metrics::to_metrics() {
         }
     }
 
+    // pinned prefix checkpoints (LLAMA_PREFIX_CKPT=1)
+    if (metrics.prefix_ckpt.enabled) {
+        const auto & pk = metrics.prefix_ckpt;
+
+        add_items("counter", {
+            { "prefix_ckpt_pinned_total",           "Context checkpoints pinned at the start of the first user message", (double) pk.n_pinned },
+            { "prefix_ckpt_restores_total",         "Prompts resumed from a pinned prefix checkpoint", (double) pk.n_restores },
+            { "prefix_ckpt_tokens_reused_total",    "Prompt tokens not processed again thanks to a pinned prefix checkpoint", (double) pk.n_tokens },
+            { "prefix_ckpt_boundary_restores_total", "Prompts resumed from a pinned user-boundary checkpoint", (double) pk.n_boundary_restores },
+            { "prefix_ckpt_cache_copies_total",     "Prompt cache entries copied into a slot for their pinned prefix checkpoint", (double) pk.n_cache_copies },
+        });
+    }
+
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
         prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
