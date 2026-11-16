@@ -55,7 +55,9 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
-    bool prepare(const std::vector<llama_ubatch> & ubatches);
+    // rs_hazard (optional): set when a ubatch would move the cell of a seq that an earlier ubatch of the same
+    // batch wrote rollback snapshots for - those snapshots are overwritten, so that seq can no longer roll back
+    bool prepare(const std::vector<llama_ubatch> & ubatches, bool * rs_hazard = nullptr);
 
     // find a contiguous slot of memory cells and emplace the ubatch there
     bool find_slot(const llama_ubatch & ubatch);
@@ -78,6 +80,9 @@ public:
     std::vector<uint32_t> rs_idx;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+
+    // seqs (not in the ubatch) whose cell the last find_slot() moved while it still had rollback snapshots
+    std::vector<llama_seq_id> rs_displaced;
 
     // computed before each graph build
     uint32_t n = 0;
