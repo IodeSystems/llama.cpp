@@ -1065,7 +1065,11 @@ public:
     }
 
     server_metrics get_metrics() const {
-        return metrics;
+        server_metrics res = metrics;
+        if (prompt_cache) {
+            res.cache = prompt_cache->get_metrics();
+        }
+        return res;
     }
 
     void reset_metrics_bucket() {
@@ -1604,7 +1608,7 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.cache_ram_policy);
 
             if (prompt_cache->limit_size > 0) {
                 prompt_cache->overflow_heap  = params_base.cache_overflow_heap && common_host_pool_enabled();
@@ -3242,7 +3246,7 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
-                    res->metrics             = metrics;
+                    res->metrics             = get_metrics();
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
