@@ -54,13 +54,20 @@ struct ggml_cuda_batch_get_mapping {
     void * host = nullptr;
     unsigned char * device = nullptr;
 
+    bool registered = false;
+
     ggml_cuda_batch_get_mapping(void * host, size_t size) {
         const cudaError_t err = cudaHostRegister(host, size, cudaHostRegisterMapped | cudaHostRegisterPortable);
-        if (err != cudaSuccess) {
+        if (err == cudaErrorHostMemoryAlreadyRegistered) {
+            // already pinned (e.g. allocated from the CUDA host buffer type): use it as is
+            (void) cudaGetLastError();
+        } else if (err != cudaSuccess) {
             (void) cudaGetLastError();
             GGML_LOG_DEBUG("%s: failed to register %.2f MiB of pinned memory: %s\n", __func__,
                            size / 1024.0 / 1024.0, cudaGetErrorString(err));
             return;
+        } else {
+            registered = true;
         }
         this->host = host;
         if (cudaHostGetDevicePointer((void **) &device, host, 0) != cudaSuccess) {
@@ -74,7 +81,7 @@ struct ggml_cuda_batch_get_mapping {
     ggml_cuda_batch_get_mapping & operator=(const ggml_cuda_batch_get_mapping &) = delete;
 
     ~ggml_cuda_batch_get_mapping() {
-        if (host) {
+        if (registered) {
             // Release only the registration acquired by this object.
             CUDA_CHECK(cudaHostUnregister(host));
         }

@@ -712,8 +712,11 @@ struct server_prompt_data {
     common_state_data main;
     common_state_data drft;
 
+    bool overflow = false; // allocated as --cache-overflow heap
+
+    // real allocated bytes
     size_t size() const {
-        return main.size() + drft.size();
+        return common_state_data_bytes(main) + common_state_data_bytes(drft);
     }
 };
 
@@ -725,7 +728,7 @@ struct server_prompt_cache_state {
         size_t res = data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
-            res += ckpt->size();
+            res += ckpt->real_size();
         }
 
         return res;
@@ -746,7 +749,29 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // --cache-overflow heap: entries beyond limit_size go to plain heap, up to limit_overflow bytes
+    bool   overflow_heap  = false;
+    size_t limit_overflow = 0;
+
+    // throttled overflow log
+    int64_t  t_ovf_log       = 0;
+    uint64_t n_ovf_saves     = 0; // saves that did not fit, since the last log
+    uint64_t n_ovf_evicted   = 0;
+    size_t   bytes_ovf_evicted = 0;
+    uint64_t n_ovf_heap      = 0;
+    size_t   bytes_ovf_heap  = 0;
+    uint64_t n_ovf_rel_sync0 = 0; // host pool budget releases at the last log
+    size_t   bytes_ovf_rel_sync0 = 0;
+    uint64_t n_ovf_frag0     = 0; // host pool arena fragmentation count at the last log
+
+    // real allocated bytes (checkpoints shared by several entries are counted per entry)
     size_t size() const;
+    size_t size_overflow() const;
+
+    // erase an entry; checkpoints still referenced elsewhere go back to slot accounting
+    std::list<server_prompt_cache_state>::iterator erase_state(std::list<server_prompt_cache_state>::iterator it);
+
+    void log_overflow(const char * what, size_t bytes);
 
     size_t n_tokens() const;
 
