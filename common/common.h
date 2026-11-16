@@ -141,6 +141,13 @@ enum dimre_method {
     DIMRE_METHOD_MEAN,
 };
 
+// prompt cache (--cache-ram) eviction order
+enum common_cache_ram_policy {
+    COMMON_CACHE_RAM_POLICY_FIFO     = 0, // oldest saved entry first
+    COMMON_CACHE_RAM_POLICY_LRU      = 1, // least recently used entry first
+    COMMON_CACHE_RAM_POLICY_WEIGHTED = 2, // largest (time since last use) / (1 + hits) first
+};
+
 enum common_conversation_mode {
     COMMON_CONVERSATION_MODE_DISABLED = 0,
     COMMON_CONVERSATION_MODE_ENABLED  = 1,
@@ -660,6 +667,7 @@ struct common_params {
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
     bool    cache_overflow_heap = false; // --cache-overflow heap: entries beyond cache-ram go to plain heap instead of evicting
     int32_t cache_overflow_max_mib = -1; // max heap overflow in MiB, -1 = same as cache-ram
+    common_cache_ram_policy cache_ram_policy = COMMON_CACHE_RAM_POLICY_FIFO; // --cache-ram-policy
 
     // llama-connect params
     bool        server_connect      = false;
