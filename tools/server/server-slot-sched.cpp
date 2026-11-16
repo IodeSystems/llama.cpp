@@ -494,6 +494,32 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+const server_prompt * server_prompt_cache::peek(const server_prompt & prompt, const server_tokens & tokens_new) const {
+    // same selection as load()
+    const int lcp_base = prompt.tokens.get_common_prefix(tokens_new);
+
+    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_base) / prompt.tokens.size() : -1.0f;
+    float f_sim_best  = float(lcp_base) / tokens_new.size();
+
+    const server_prompt * res = nullptr;
+    for (const auto & state : states) {
+        const int lcp_cur = state.prompt.tokens.get_common_prefix(tokens_new);
+
+        const float f_keep_cur = float(lcp_cur) / state.prompt.tokens.size();
+        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+
+        if (f_keep_cur < 0.25f) {
+            continue;
+        }
+        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+            f_keep_best = f_keep_cur;
+            f_sim_best  = f_sim_cur;
+            res = &state.prompt;
+        }
+    }
+    return res;
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 

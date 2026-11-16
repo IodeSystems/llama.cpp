@@ -1707,6 +1707,22 @@ std::string server_task_result_metrics::to_metrics() {
                    << "llamacpp:prompt_cache_evicted_age_seconds_count " << pc.n_age << "\n";
     }
 
+    // cross-slot KV reuse (LLAMA_XSLOT=1)
+    if (metrics.xslot.enabled) {
+        const auto & xs = metrics.xslot;
+
+        add_items("counter", {
+            { "xslot_attach_total",        "Requests started from another slot's cells (cross-slot KV reuse)", (double) xs.n_attach },
+            { "xslot_tokens_reused_total", "Usable prefix tokens of the requests started from another slot's cells", (double) xs.n_tokens },
+        });
+
+        prometheus << "# HELP llamacpp:xslot_skipped_total Requests where another slot held a longer usable prefix but was not attached, by reason\n"
+                   << "# TYPE llamacpp:xslot_skipped_total counter\n";
+        for (int i = 0; i < SERVER_XSLOT_SKIP_N_REASONS; i++) {
+            prometheus << "llamacpp:xslot_skipped_total{reason=\"" << server_xslot_skip_reason_str((server_xslot_skip_reason) i) << "\"} " << xs.n_skipped[i] << "\n";
+        }
+    }
+
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
         prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
